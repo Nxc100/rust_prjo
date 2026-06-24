@@ -1,0 +1,33 @@
+[package]
+name = "visual_coast_batch"
+version = "1.0.0"
+edition = "2021"
+description = "视觉海岸批量处理工作台 — RunningHub 批量精修/高清放大桌面程序"
+
+[[bin]]
+name = "visual_coast_batch"
+path = "src/main.rs"
+
+[dependencies]
+eframe  = "0.34"            # egui + 窗口/渲染（默认 wgpu 后端）
+egui    = "0.34"
+# Windows 上用系统 Schannel（native-tls）做 TLS：纯 Rust 链接、无 OpenSSL、无需 C 编译器，
+# 仍是单个自包含 exe（与 rustls 方案目标一致，但兼容当前 GNU 工具链）。
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "multipart", "default-tls"] }
+serde       = { version = "1", features = ["derive"] }
+serde_json  = "1"
+rfd     = "0.15"           # 原生“选择文件夹/文件”对话框
+anyhow  = "1"
+crossbeam-channel = "0.5"  # 后台→UI 的消息通道、worker 任务队列
+# 解码图片做缩略图（处理前/后对比预览）。纯 Rust 编解码，无需 C 编译器。
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "webp"] }
+
+[build-dependencies]
+winresource = "0.1"        # 给 exe 加图标（assets/app.ico 存在时生效）
+
+[profile.release]
+opt-level = "z"            # 体积优先
+lto = true
+strip = true
+codegen-units = 1
+panic = "abort"
