@@ -18,12 +18,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use api::{CreateOutcome, PollState, RhClient, RhSettings};
+use api::{AccountInfo, CreateOutcome, PollState, RhClient, RhSettings};
 
 const APP_TITLE: &str = "视觉海岸批量处理工作台";
 const CONFIG_FILE: &str = "vc_batch_config.json";
 const IMAGE_EXTS: [&str; 5] = ["png", "jpg", "jpeg", "webp", "bmp"];
-const THUMB_MAX: u32 = 1100; // 预览缩略图最长边像素
+const PREVIEW_MAX: u32 = 8192; // 预览大图最长边像素（再按 GPU 纹理上限夹紧）；放大对比需要全分辨率才不发虚
+const LIST_THUMB_MAX: u32 = 96; // 列表小缩略图最长边像素
 
 // ============ 现代浅色配色（海岸青绿强调，高级浅色）============
 mod pal {
@@ -35,8 +36,9 @@ mod pal {
     pub const FIELD: Color32 = Color32::from_rgb(242, 245, 248); // 输入框底
     pub const BTN: Color32 = Color32::from_rgb(237, 240, 245); // 次按钮底
     pub const BTN_HI: Color32 = Color32::from_rgb(226, 232, 240);
-    pub const STROKE: Color32 = Color32::from_rgb(224, 229, 236); // 细边框
-    pub const STROKE_HI: Color32 = Color32::from_rgb(199, 207, 217);
+    pub const STROKE: Color32 = Color32::from_rgb(224, 229, 236); // 细边框（卡片/面板）
+    pub const STROKE_HI: Color32 = Color32::from_rgb(190, 198, 209); // 输入框/按钮静态边框
+    pub const STROKE_STRONG: Color32 = Color32::from_rgb(150, 160, 174); // 悬停/聚焦更明显的边框
     pub const TEXT: Color32 = Color32::from_rgb(30, 41, 59); // slate-800
     pub const TEXT_WEAK: Color32 = Color32::from_rgb(100, 116, 139); // slate-500
     pub const ACCENT: Color32 = Color32::from_rgb(13, 148, 136); // teal-600
@@ -71,6 +73,11 @@ struct UiConfig {
     create_retry: u32,
     create_retry_wait: u64,
     net_retry: u32,
+
+    // —— 收尾与预警 ——
+    auto_open_output: bool, // 跑完自动打开输出文件夹
+    notify_sound: bool,     // 跑完播放提示音
+    coins_per_image: f64,   // 每张预估消耗（>0 时用于跑前余额预警）
 }
 
 impl Default for UiConfig {
@@ -94,7 +101,73 @@ impl Default for UiConfig {
             create_retry: 20,
             create_retry_wait: 15,
             net_retry: 4,
+
+            auto_open_output: false,
+            notify_sound: true,
+            coins_per_image: 0.0,
         }
+    }
+}
+
+// ============ 配置预设 + 窗口布局（持久化的整体存档）============
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(default)]
+struct Preset {
+    name: String,
+    cfg: UiConfig,
+}
+impl Default for Preset {
+    fn default() -> Self {
+        Self {
+            name: "默认".into(),
+            cfg: UiConfig::default(),
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(default)]
+struct Store {
+    presets: Vec<Preset>,
+    current: usize,
+    win_w: f32,
+    win_h: f32,
+    left_w: f32,
+    logs_h: f32,
+}
+impl Default for Store {
+    fn default() -> Self {
+        Self {
+            presets: vec![Preset::default()],
+            current: 0,
+            win_w: 1180.0,
+            win_h: 800.0,
+            left_w: 340.0,
+            logs_h: 140.0,
+        }
+    }
+}
+impl Store {
+    fn normalized(mut self) -> Self {
+        if self.presets.is_empty() {
+            self.presets.push(Preset::default());
+        }
+        if self.current >= self.presets.len() {
+            self.current = self.presets.len() - 1;
+        }
+        if !(self.win_w.is_finite() && self.win_w >= 640.0) {
+            self.win_w = 1180.0;
+        }
+        if !(self.win_h.is_finite() && self.win_h >= 480.0) {
+            self.win_h = 800.0;
+        }
+        if !(self.left_w.is_finite() && self.left_w >= 160.0) {
+            self.left_w = 340.0;
+        }
+        if !(self.logs_h.is_finite() && self.logs_h >= 60.0) {
+            self.logs_h = 140.0;
+        }
+        self
     }
 }
 
@@ -104,15 +177,38 @@ fn config_path() -> PathBuf {
         .and_then(|p| p.parent().map(|d| d.join(CONFIG_FILE)))
         .unwrap_or_else(|| PathBuf::from(CONFIG_FILE))
 }
-fn load_config() -> UiConfig {
-    std::fs::read_to_string(config_path())
+fn parse_store(txt: &str) -> Store {
+    // 用是否“真的带 presets 字段”来区分新旧格式：
+    // 注意不能只看 from_str::<Store> 是否成功——因为 #[serde(default)] 会把缺失的
+    // presets 用 Store::default()（含一个默认预设）补上，导致旧配置被误判为新格式而丢失。
+    let has_presets = serde_json::from_str::<serde_json::Value>(txt)
         .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+        .and_then(|v| v.get("presets").and_then(|p| p.as_array()).map(|a| !a.is_empty()))
+        .unwrap_or(false);
+    if has_presets {
+        if let Ok(s) = serde_json::from_str::<Store>(txt) {
+            return s.normalized();
+        }
+    }
+    // 兼容旧格式：裸 UiConfig，包成单个预设。
+    if let Ok(cfg) = serde_json::from_str::<UiConfig>(txt) {
+        return Store {
+            presets: vec![Preset {
+                name: "默认".into(),
+                cfg,
+            }],
+            ..Default::default()
+        }
+        .normalized();
+    }
+    Store::default()
 }
-fn save_config(c: &UiConfig) {
-    if let Ok(s) = serde_json::to_string_pretty(c) {
-        let _ = std::fs::write(config_path(), s);
+fn load_store() -> Store {
+    parse_store(&std::fs::read_to_string(config_path()).unwrap_or_default())
+}
+fn save_store(s: &Store) {
+    if let Ok(txt) = serde_json::to_string_pretty(s) {
+        let _ = std::fs::write(config_path(), txt);
     }
 }
 
@@ -170,19 +266,103 @@ impl Stage {
     }
 }
 
+// 列表状态筛选
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ListFilter {
+    All,
+    Active,
+    Ok,
+    Skipped,
+    Failed,
+}
+impl ListFilter {
+    fn label(self) -> &'static str {
+        match self {
+            ListFilter::All => "全部",
+            ListFilter::Active => "进行中",
+            ListFilter::Ok => "成功",
+            ListFilter::Skipped => "跳过",
+            ListFilter::Failed => "失败",
+        }
+    }
+    fn matches(self, st: Stage) -> bool {
+        match self {
+            ListFilter::All => true,
+            ListFilter::Active => st.is_active() || st == Stage::Queued,
+            ListFilter::Ok => st == Stage::Done,
+            ListFilter::Skipped => st == Stage::Skipped,
+            ListFilter::Failed => st == Stage::Failed,
+        }
+    }
+}
+
+// 日志级别过滤
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LogFilter {
+    All,
+    Info,
+    Success,
+    Warn,
+    Error,
+}
+impl LogFilter {
+    fn label(self) -> &'static str {
+        match self {
+            LogFilter::All => "全部",
+            LogFilter::Info => "信息",
+            LogFilter::Success => "成功",
+            LogFilter::Warn => "警告",
+            LogFilter::Error => "错误",
+        }
+    }
+}
+
+// 对比模式
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CmpMode {
+    Side, // 并排
+    Wipe, // 滑动对比
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum Which {
     Input,
     Output,
+    List,
+}
+impl Which {
+    fn key(self) -> &'static str {
+        match self {
+            Which::Input => "in",
+            Which::Output => "out",
+            Which::List => "list",
+        }
+    }
 }
 
 // ============ 后台→UI 的消息 ============
 enum Msg {
     Files(Vec<(String, PathBuf)>),
-    Stage { idx: usize, stage: Stage, detail: String },
-    Outputs { idx: usize, paths: Vec<PathBuf> },
+    Stage {
+        idx: usize,
+        stage: Stage,
+        detail: String,
+    },
+    Outputs {
+        idx: usize,
+        paths: Vec<PathBuf>,
+        task_id: String,
+    },
     Log(String),
-    Thumb { idx: usize, which: Which, w: usize, h: usize, rgba: Vec<u8> },
+    Thumb {
+        idx: usize,
+        which: Which,
+        w: usize,
+        h: usize,
+        rgba: Vec<u8>,
+    },
+    Account(AccountInfo),
+    AccountErr(String),
     Finished,
 }
 
@@ -193,10 +373,20 @@ struct Item {
     stage: Stage,
     detail: String,
     outputs: Vec<PathBuf>,
+    task_id: String,
     in_tex: Option<egui::TextureHandle>,
     out_tex: Option<egui::TextureHandle>,
+    list_tex: Option<egui::TextureHandle>,
     in_req: bool,
     out_req: bool,
+    list_req: bool,
+}
+
+// ============ 运行模式 ============
+#[derive(Clone)]
+enum RunMode {
+    Full { extra: Vec<PathBuf> }, // 读输入目录 + 追加拖入的文件
+    Subset(Vec<(usize, PathBuf)>), // 仅重跑指定 UI 索引（失败重试 / 重跑选中）
 }
 
 // ============ 跑批配置快照 ============
@@ -206,11 +396,13 @@ struct BatchConfig {
     input_node: String,
     output_node: Option<String>,
     extra_overrides: Vec<serde_json::Value>,
+    mode: RunMode,
 }
 
 // ============ 应用状态 ============
 struct App {
-    cfg: UiConfig,
+    store: Store,
+    cfg: UiConfig, // 当前预设的工作副本，表单直接绑定它
     detected_in: String,
     detected_out: String,
     running: bool,
@@ -222,14 +414,50 @@ struct App {
     tx: Sender<Msg>,
     rx: Receiver<Msg>,
     stop: Arc<AtomicBool>,
+
+    // 账户
+    account: Option<AccountInfo>,
+    account_err: Option<String>,
+    account_loading: bool,
+
+    // 拖拽追加的额外图片（本会话有效，不持久化）
+    extra_files: Vec<PathBuf>,
+
+    // 工作流参数（P1.8）
+    parsed_wf: String,                       // 上次解析过的工作流路径，用于检测变化
+    detected_params: Vec<workflow::DetectedParam>,
+    param_on: Vec<bool>,                     // 是否覆盖
+    param_val: Vec<String>,                  // 编辑中的值（字符串）
+
+    // 列表与日志过滤
+    list_filter: ListFilter,
+    log_filter: LogFilter,
+    log_search: String,
+
+    // 对比查看器状态
+    cmp_mode: CmpMode,
+    cmp_wipe: f32,
+    cmp_zoom: f32,
+    cmp_offset: egui::Vec2,
+    cmp_drag_wipe: bool,
+    cmp_fit_w: f32, // 上一帧 zoom=1 时的显示宽，用于 1:1 计算
+
+    // 完成横幅
+    finished_banner: bool,
+
+    // 主题/字体是否已应用到当前 ctx（首帧懒应用，便于 headless 测试）
+    themed: bool,
 }
 
 impl App {
-    fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        apply_theme(&cc.egui_ctx);
+    // 只建结构体（不碰 egui ctx、不联网），供正式启动与 headless 测试共用。
+    fn build() -> Self {
         let (tx, rx) = crossbeam_channel::unbounded();
+        let store = load_store();
+        let cfg = store.presets[store.current].cfg.clone();
         Self {
-            cfg: load_config(),
+            store,
+            cfg,
             detected_in: String::new(),
             detected_out: String::new(),
             running: false,
@@ -241,7 +469,54 @@ impl App {
             tx,
             rx,
             stop: Arc::new(AtomicBool::new(false)),
+            account: None,
+            account_err: None,
+            account_loading: false,
+            extra_files: Vec::new(),
+            parsed_wf: String::new(),
+            detected_params: Vec::new(),
+            param_on: Vec::new(),
+            param_val: Vec::new(),
+            list_filter: ListFilter::All,
+            log_filter: LogFilter::All,
+            log_search: String::new(),
+            cmp_mode: CmpMode::Side,
+            cmp_wipe: 0.5,
+            cmp_zoom: 1.0,
+            cmp_offset: egui::Vec2::ZERO,
+            cmp_drag_wipe: false,
+            cmp_fit_w: 1.0,
+            finished_banner: false,
+            themed: false,
         }
+    }
+
+    fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        apply_theme(&cc.egui_ctx);
+        let mut app = Self::build();
+        app.themed = true;
+        // 启动即解析一次工作流参数 + 异步刷新账户。
+        app.reparse_workflow_if_changed();
+        app.refresh_account();
+        app
+    }
+
+    // headless 构造：用于 egui_kittest UI 测试（无 CreationContext、不联网、不读盘）。
+    #[cfg(test)]
+    fn new_headless() -> Self {
+        let mut a = Self::build();
+        a.store = Store::default(); // 不受本机已存配置影响，保证测试确定性
+        a.cfg = a.store.presets[0].cfg.clone();
+        a
+    }
+
+    // 把当前工作副本写回当前预设并落盘。
+    fn save_all(&mut self) {
+        let i = self.store.current.min(self.store.presets.len().saturating_sub(1));
+        if let Some(p) = self.store.presets.get_mut(i) {
+            p.cfg = self.cfg.clone();
+        }
+        save_store(&self.store);
     }
 
     fn counts(&self) -> (usize, usize, usize, usize) {
@@ -260,16 +535,120 @@ impl App {
         (done, ok, skip, fail)
     }
 
-    fn start(&mut self, ctx: &egui::Context) {
-        self.logs.clear();
+    fn failed_indices(&self) -> Vec<usize> {
+        self.items
+            .iter()
+            .enumerate()
+            .filter(|(_, it)| it.stage == Stage::Failed)
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    // 后台异步查询账户（不卡 UI）。
+    fn refresh_account(&mut self) {
+        let key = self.cfg.api_key.trim().to_string();
+        if key.is_empty() || self.account_loading {
+            return;
+        }
+        self.account_loading = true;
+        self.account_err = None;
+        let tx = self.tx.clone();
+        let net_retry = self.cfg.net_retry.max(1);
+        std::thread::spawn(move || match RhClient::new(key, RhSettings { net_retry }) {
+            Ok(c) => match c.account_status_checked() {
+                Ok(info) => {
+                    let _ = tx.send(Msg::Account(info));
+                }
+                Err(e) => {
+                    let _ = tx.send(Msg::AccountErr(e.to_string()));
+                }
+            },
+            Err(e) => {
+                let _ = tx.send(Msg::AccountErr(e.to_string()));
+            }
+        });
+    }
+
+    // 当工作流 JSON 路径变化时，重新识别节点 + 解析可调参数。
+    fn reparse_workflow_if_changed(&mut self) {
+        let name = self.cfg.workflow_json.trim().to_string();
+        if name == self.parsed_wf {
+            return;
+        }
+        self.parsed_wf = name.clone();
+        self.detected_in.clear();
+        self.detected_out.clear();
+        self.detected_params.clear();
+        self.param_on.clear();
+        self.param_val.clear();
+        if name.is_empty() {
+            return;
+        }
+        let path = resolve_workflow_path(&name);
+        if !path.exists() {
+            return;
+        }
+        if let Ok(io) = workflow::detect_io_nodes(&path) {
+            self.detected_in = io.input_node.clone().unwrap_or_default();
+            self.detected_out = io.output_node.clone().unwrap_or_default();
+        }
+        if let Ok(params) = workflow::detect_params(&path) {
+            self.param_on = vec![false; params.len()];
+            self.param_val = params.iter().map(|p| json_value_to_edit(&p.value)).collect();
+            self.detected_params = params;
+        }
+    }
+
+    // 根据用户勾选的参数覆盖，拼出 nodeInfoList 覆盖项。
+    fn param_override_values(&self) -> Vec<serde_json::Value> {
+        let mut out = Vec::new();
+        for (i, p) in self.detected_params.iter().enumerate() {
+            if !self.param_on.get(i).copied().unwrap_or(false) {
+                continue;
+            }
+            let raw = self.param_val.get(i).cloned().unwrap_or_default();
+            let value = edit_to_json_value(&raw, &p.value);
+            out.push(serde_json::json!({
+                "nodeId": p.node_id,
+                "fieldName": p.field,
+                "fieldValue": value,
+            }));
+        }
+        out
+    }
+
+    fn start_full(&mut self, ctx: &egui::Context) {
+        let extra = self.extra_files.clone();
+        self.start_run(ctx, RunMode::Full { extra });
+    }
+
+    fn start_subset(&mut self, ctx: &egui::Context, idxs: Vec<usize>) {
+        let subset: Vec<(usize, PathBuf)> = idxs
+            .into_iter()
+            .filter_map(|i| self.items.get(i).map(|it| (i, it.input.clone())))
+            .collect();
+        if subset.is_empty() {
+            self.logs.push("ℹ 没有可重跑的项目。".into());
+            return;
+        }
+        self.start_run(ctx, RunMode::Subset(subset));
+    }
+
+    fn start_run(&mut self, ctx: &egui::Context, mode: RunMode) {
         // 清空旧通道里的残留消息
         while self.rx.try_recv().is_ok() {}
+        self.finished_banner = false;
+
+        let is_full = matches!(mode, RunMode::Full { .. });
+        if is_full {
+            self.logs.clear();
+        }
 
         // 1) 必填校验
         let missing: Vec<&str> = [
             ("apiKey", self.cfg.api_key.trim().is_empty()),
             ("workflowId", self.cfg.workflow_id.trim().is_empty()),
-            ("输入文件夹", self.cfg.input_dir.trim().is_empty()),
+            ("输入文件夹", self.cfg.input_dir.trim().is_empty() && self.extra_files.is_empty()),
             ("输出文件夹", self.cfg.output_dir.trim().is_empty()),
         ]
         .iter()
@@ -338,34 +717,78 @@ impl App {
             detected_out
         };
 
-        let extra_overrides = match parse_extra_overrides(&self.cfg.extra_overrides) {
+        // 额外覆盖 = 手写 JSON + 表单勾选的参数
+        let mut extra_overrides = match parse_extra_overrides(&self.cfg.extra_overrides) {
             Ok(v) => v,
             Err(e) => {
                 self.logs.push(format!("❌ 额外节点参数 JSON 无效：{e}"));
                 return;
             }
         };
+        extra_overrides.extend(self.param_override_values());
 
-        save_config(&self.cfg);
+        self.save_all();
 
         // 3) 重置运行状态并启动后台
         self.stop = Arc::new(AtomicBool::new(false));
         self.running = true;
-        self.items.clear();
-        self.selected = None;
-        self.follow = true;
-        self.show_settings = false; // 跑起来后自动收起设置，腾出空间看进度/对比
+        if is_full {
+            self.items.clear();
+            self.selected = None;
+            self.follow = true;
+            self.show_settings = false; // 跑起来后自动收起设置，腾出空间看进度/对比
+        } else {
+            // 子集重跑：把这些项的状态重置为等待，清掉旧结果显示
+            if let RunMode::Subset(ref subset) = mode {
+                for (idx, _) in subset {
+                    if let Some(it) = self.items.get_mut(*idx) {
+                        it.stage = Stage::Queued;
+                        it.detail.clear();
+                        it.outputs.clear();
+                        it.out_tex = None;
+                        it.out_req = false;
+                    }
+                }
+            }
+        }
 
         let batch = BatchConfig {
             cfg: self.cfg.clone(),
             input_node,
             output_node,
             extra_overrides,
+            mode,
         };
         let stop = self.stop.clone();
         let tx = self.tx.clone();
         let ctx2 = ctx.clone();
         std::thread::spawn(move || run_batch(batch, tx, stop, ctx2));
+    }
+
+    // 处理拖入文件：文件夹→设输入目录；图片→追加到 extra_files
+    fn handle_drop(&mut self, dropped: Vec<egui::DroppedFile>) {
+        let mut added = 0;
+        for f in dropped {
+            let Some(p) = f.path else { continue };
+            if p.is_dir() {
+                self.cfg.input_dir = p.display().to_string();
+                self.logs.push(format!("📂 已设输入文件夹：{}", p.display()));
+            } else if p.is_file() {
+                let ok = p
+                    .extension()
+                    .and_then(|s| s.to_str())
+                    .map(|e| IMAGE_EXTS.contains(&e.to_lowercase().as_str()))
+                    .unwrap_or(false);
+                if ok && !self.extra_files.contains(&p) {
+                    self.extra_files.push(p);
+                    added += 1;
+                }
+            }
+        }
+        if added > 0 {
+            self.logs
+                .push(format!("➕ 追加 {added} 张图片（共 {} 张附加）", self.extra_files.len()));
+        }
     }
 
     // 处理后台消息，必要时上传纹理
@@ -385,10 +808,13 @@ impl App {
                             stage: Stage::Queued,
                             detail: String::new(),
                             outputs: Vec::new(),
+                            task_id: String::new(),
                             in_tex: None,
                             out_tex: None,
+                            list_tex: None,
                             in_req: false,
                             out_req: false,
+                            list_req: false,
                         })
                         .collect();
                     if !self.items.is_empty() {
@@ -402,11 +828,15 @@ impl App {
                     }
                     if self.follow && stage.is_active() {
                         self.selected = Some(idx);
+                        self.reset_compare_view();
                     }
                 }
-                Msg::Outputs { idx, paths } => {
+                Msg::Outputs { idx, paths, task_id } => {
                     if let Some(it) = self.items.get_mut(idx) {
                         it.outputs = paths;
+                        if !task_id.is_empty() {
+                            it.task_id = task_id;
+                        }
                         it.out_tex = None;
                         it.out_req = false;
                     }
@@ -421,7 +851,7 @@ impl App {
                 Msg::Thumb { idx, which, w, h, rgba } => {
                     let color = egui::ColorImage::from_rgba_unmultiplied([w, h], &rgba);
                     let tex = ctx.load_texture(
-                        format!("thumb-{idx}-{}", which == Which::Input),
+                        format!("thumb-{idx}-{}", which.key()),
                         color,
                         egui::TextureOptions::LINEAR,
                     );
@@ -429,17 +859,75 @@ impl App {
                         match which {
                             Which::Input => it.in_tex = Some(tex),
                             Which::Output => it.out_tex = Some(tex),
+                            Which::List => it.list_tex = Some(tex),
                         }
                     }
                 }
-                Msg::Finished => self.running = false,
+                Msg::Account(info) => {
+                    self.account = Some(info);
+                    self.account_err = None;
+                    self.account_loading = false;
+                }
+                Msg::AccountErr(e) => {
+                    self.account = None;
+                    self.account_err = Some(e);
+                    self.account_loading = false;
+                }
+                Msg::Finished => {
+                    self.running = false;
+                    self.finished_banner = true;
+                    // 写清单（从 items 汇总，子集重跑后也是完整的）
+                    if !self.items.is_empty() {
+                        match write_manifest(&self.cfg.output_dir, &self.items) {
+                            Ok(p) => self.logs.push(format!("清单已写入：{p}")),
+                            Err(e) => self.logs.push(format!("⚠ 写清单失败：{e}")),
+                        }
+                    }
+                    // 收尾：任务栏闪烁 + 可选提示音 + 可选打开输出目录
+                    ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
+                        egui::UserAttentionType::Informational,
+                    ));
+                    if self.cfg.notify_sound {
+                        notify_beep();
+                    }
+                    if self.cfg.auto_open_output && !self.cfg.output_dir.trim().is_empty() {
+                        open_folder(&self.cfg.output_dir);
+                    }
+                    // 余额变了，刷新一下
+                    self.refresh_account();
+                }
             }
         }
     }
 
-    // 为选中项按需请求缩略图解码（后台线程解码，避免卡 UI）
+    fn reset_compare_view(&mut self) {
+        self.cmp_zoom = 1.0;
+        self.cmp_offset = egui::Vec2::ZERO;
+        self.cmp_wipe = 0.5;
+    }
+
+    // 为选中项按需请求大图预览解码（后台线程解码，避免卡 UI）。
+    // 预览用「全分辨率」纹理（按 GPU 纹理上限夹紧），这样放大对比时仍清晰，
+    // 而不是把上限 ~1100px 的小图拉大导致发虚。为控制显存，只保留当前选中项的大图，
+    // 切换选中时释放其它项的预览纹理（列表小缩略图 list_tex 不动）。
     fn request_thumbs(&mut self, ctx: &egui::Context) {
         let Some(idx) = self.selected else { return };
+
+        // 释放非选中项的大图纹理，保证同时只驻留一张原图 + 一张结果图。
+        for (i, it) in self.items.iter_mut().enumerate() {
+            if i != idx && (it.in_tex.is_some() || it.out_tex.is_some()) {
+                it.in_tex = None;
+                it.out_tex = None;
+                it.in_req = false;
+                it.out_req = false;
+            }
+        }
+
+        // 解码上限：取 GPU 允许的最大纹理边，再夹到 PREVIEW_MAX；绝不超过 GPU 上限以免上传失败。
+        let cap = (ctx.input(|i| i.max_texture_side) as u32)
+            .min(PREVIEW_MAX)
+            .max(LIST_THUMB_MAX);
+
         let (need_in, need_out, in_path, out_path) = {
             let Some(it) = self.items.get(idx) else { return };
             let need_in = it.in_tex.is_none() && !it.in_req;
@@ -453,12 +941,12 @@ impl App {
         };
         if need_in {
             self.items[idx].in_req = true;
-            spawn_decode(self.tx.clone(), ctx.clone(), idx, Which::Input, in_path);
+            spawn_decode(self.tx.clone(), ctx.clone(), idx, Which::Input, in_path, cap);
         }
         if need_out {
             if let Some(p) = out_path {
                 self.items[idx].out_req = true;
-                spawn_decode(self.tx.clone(), ctx.clone(), idx, Which::Output, p);
+                spawn_decode(self.tx.clone(), ctx.clone(), idx, Which::Output, p, cap);
             }
         }
     }
@@ -466,9 +954,35 @@ impl App {
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.render(ui);
+    }
+}
+
+impl App {
+    fn render(&mut self, ui: &mut egui::Ui) {
+        if !self.themed {
+            apply_theme(ui.ctx());
+            self.themed = true;
+        }
         let ctx = ui.ctx().clone();
         self.drain(&ctx);
         self.request_thumbs(&ctx);
+
+        // 拖拽导入
+        let dropped = ctx.input(|i| i.raw.dropped_files.clone());
+        if !dropped.is_empty() {
+            self.handle_drop(dropped);
+        }
+
+        // 记忆窗口尺寸（用于下次启动还原）
+        if let Some(r) = ctx.input(|i| i.viewport().inner_rect) {
+            self.store.win_w = r.width();
+            self.store.win_h = r.height();
+        }
+        // 关闭前保存
+        if ctx.input(|i| i.viewport().close_requested()) {
+            self.save_all();
+        }
 
         let header_shadow = egui::Shadow {
             offset: [0, 3],
@@ -479,19 +993,38 @@ impl eframe::App for App {
         egui::Panel::top("header")
             .frame(panel_frame(pal::SURFACE, 18, 12, header_shadow))
             .show_inside(ui, |ui| self.header(ui, &ctx));
-        egui::Panel::bottom("logs")
+        let logs_resp = egui::Panel::bottom("logs")
             .resizable(true)
-            .default_size(140.0)
+            .default_size(self.store.logs_h)
             .frame(panel_frame(pal::BG, 14, 8, egui::Shadow::NONE))
             .show_inside(ui, |ui| self.log_panel(ui));
-        egui::Panel::left("list")
+        self.store.logs_h = logs_resp.response.rect.height();
+        let list_resp = egui::Panel::left("list")
             .resizable(true)
-            .default_size(340.0)
+            .default_size(self.store.left_w)
             .frame(panel_frame(pal::PANEL, 12, 10, egui::Shadow::NONE))
             .show_inside(ui, |ui| self.list_panel(ui));
+        self.store.left_w = list_resp.response.rect.width();
         egui::CentralPanel::default()
             .frame(panel_frame(pal::BG, 16, 14, egui::Shadow::NONE))
             .show_inside(ui, |ui| self.preview_panel(ui));
+
+        // 拖拽悬停提示
+        if ctx.input(|i| !i.raw.hovered_files.is_empty()) {
+            let screen = ctx.content_rect();
+            let p = ctx.layer_painter(egui::LayerId::new(
+                egui::Order::Foreground,
+                egui::Id::new("drop_overlay"),
+            ));
+            p.rect_filled(screen, 0.0, egui::Color32::from_rgba_unmultiplied(13, 148, 136, 36));
+            p.text(
+                screen.center(),
+                egui::Align2::CENTER_CENTER,
+                "松开以导入图片 / 文件夹",
+                egui::FontId::proportional(26.0),
+                pal::ACCENT_DK,
+            );
+        }
 
         if self.running {
             ctx.request_repaint_after(Duration::from_millis(150));
@@ -515,12 +1048,16 @@ impl App {
                     ("● 就绪", pal::SUCCESS)
                 };
                 ui.label(egui::RichText::new(txt).color(col).small());
+                ui.add_space(10.0);
+                self.account_badge(ui);
             });
         });
         ui.add_space(10.0);
 
         // 控制栏
         let mut want_start = false;
+        let mut want_retry_failed = false;
+        let mut want_rerun_selected = false;
         ui.horizontal(|ui| {
             if !self.running {
                 let btn = egui::Button::new(
@@ -551,6 +1088,27 @@ impl App {
                 }
             }
 
+            // 重试失败 / 重跑选中
+            let nfail = self.failed_indices().len();
+            if ui
+                .add_enabled(
+                    !self.running && nfail > 0,
+                    egui::Button::new(format!("↻  重试失败项 ({nfail})")),
+                )
+                .clicked()
+            {
+                want_retry_failed = true;
+            }
+            if ui
+                .add_enabled(
+                    !self.running && self.selected.is_some(),
+                    egui::Button::new("⟳  重跑选中"),
+                )
+                .clicked()
+            {
+                want_rerun_selected = true;
+            }
+
             if ui
                 .add_enabled(
                     !self.cfg.output_dir.trim().is_empty(),
@@ -563,6 +1121,17 @@ impl App {
             ui.checkbox(&mut self.follow, "跟随处理中");
             ui.toggle_value(&mut self.show_settings, "⚙  参数设置");
         });
+
+        // 完成横幅
+        if self.finished_banner && !self.running && !self.items.is_empty() {
+            ui.add_space(6.0);
+            let (_, ok, skip, fail) = self.counts();
+            banner(
+                ui,
+                pal::SUCCESS,
+                &format!("✅ 处理完成：成功 {ok}，跳过 {skip}，失败 {fail}"),
+            );
+        }
 
         // 进度
         let total = self.items.len();
@@ -603,82 +1172,160 @@ impl App {
         }
 
         if want_start {
-            self.start(ctx);
+            self.start_full(ctx);
+        } else if want_retry_failed {
+            let idxs = self.failed_indices();
+            self.start_subset(ctx, idxs);
+        } else if want_rerun_selected {
+            if let Some(i) = self.selected {
+                self.start_subset(ctx, vec![i]);
+            }
+        }
+    }
+
+    // 顶部常驻账户徽章
+    fn account_badge(&mut self, ui: &mut egui::Ui) {
+        if ui.small_button("⟳").on_hover_text("刷新账户").clicked() {
+            self.refresh_account();
+        }
+        if self.account_loading {
+            ui.label(egui::RichText::new("账户查询中…").color(pal::TEXT_WEAK).small());
+        } else if let Some(e) = &self.account_err {
+            ui.label(
+                egui::RichText::new(format!("账户：{e}"))
+                    .color(pal::ERROR)
+                    .small(),
+            );
+        } else if let Some(a) = &self.account {
+            let coins = a.remain_coins.clone().unwrap_or_else(|| "?".into());
+            let tasks = a.current_task_counts.clone().unwrap_or_else(|| "?".into());
+            let low = coins_value(a).map(|c| c <= 0.0).unwrap_or(false);
+            count_chip(
+                ui,
+                format!("🪙 余额 {coins}"),
+                if low { pal::ERROR } else { pal::ACCENT },
+            );
+            count_chip(ui, format!("⛓ 并发 {tasks}"), pal::INFO);
         }
     }
 
     fn settings_form(&mut self, ui: &mut egui::Ui) {
-        egui::Grid::new("form")
-            .num_columns(2)
-            .spacing([10.0, 8.0])
-            .show(ui, |ui| {
-                ui.label("API Key");
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.cfg.api_key)
-                        .password(true)
-                        .hint_text("头像 → API 调用 页面创建并复制")
-                        .desired_width(460.0),
+        // —— 预设切换 ——
+        self.preset_bar(ui);
+        ui.add_space(6.0);
+
+        // —— 主参数：全宽自适应行，长路径 / API Key 完整可见 ——
+        ui.horizontal(|ui| {
+            field_label(ui, "API Key");
+            let bw = 88.0;
+            let w = (ui.available_width() - bw - 8.0).max(160.0);
+            ui.add(
+                egui::TextEdit::singleline(&mut self.cfg.api_key)
+                    .password(true)
+                    .hint_text("头像 → API 调用 页面创建并复制")
+                    .desired_width(w),
+            );
+            if ui.add_sized([bw, 30.0], egui::Button::new("测试连接")).clicked() {
+                self.refresh_account();
+            }
+        });
+
+        ui.horizontal(|ui| {
+            field_label(ui, "工作流 ID");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.cfg.workflow_id)
+                    .hint_text("网址 /workflow/ 后面那串数字")
+                    .desired_width(ui.available_width()),
+            );
+        });
+
+        ui.horizontal(|ui| {
+            field_label(ui, "输入文件夹");
+            let bw = 64.0;
+            let w = (ui.available_width() - bw - 8.0).max(140.0);
+            ui.add(
+                egui::TextEdit::singleline(&mut self.cfg.input_dir)
+                    .hint_text("也可直接把文件夹/图片拖进窗口")
+                    .desired_width(w),
+            );
+            if ui.add_sized([bw, 30.0], egui::Button::new("浏览…")).clicked() {
+                if let Some(p) = rfd::FileDialog::new().pick_folder() {
+                    self.cfg.input_dir = p.display().to_string();
+                }
+            }
+        });
+
+        ui.horizontal(|ui| {
+            field_label(ui, "输出文件夹");
+            let bw = 64.0;
+            let w = (ui.available_width() - bw - 8.0).max(140.0);
+            ui.add(egui::TextEdit::singleline(&mut self.cfg.output_dir).desired_width(w));
+            if ui.add_sized([bw, 30.0], egui::Button::new("浏览…")).clicked() {
+                if let Some(p) = rfd::FileDialog::new().pick_folder() {
+                    self.cfg.output_dir = p.display().to_string();
+                }
+            }
+        });
+
+        ui.horizontal(|ui| {
+            field_label(ui, "工作流 JSON");
+            let bw = 64.0;
+            let w = (ui.available_width() - bw - 8.0).max(140.0);
+            ui.add(
+                egui::TextEdit::singleline(&mut self.cfg.workflow_json)
+                    .hint_text("用于自动识别输入/输出节点")
+                    .desired_width(w),
+            );
+            if ui.add_sized([bw, 30.0], egui::Button::new("浏览…")).clicked() {
+                if let Some(p) = rfd::FileDialog::new().add_filter("json", &["json"]).pick_file() {
+                    self.cfg.workflow_json = p.display().to_string();
+                }
+            }
+        });
+
+        ui.horizontal(|ui| {
+            field_label(ui, "并发数");
+            ui.add(egui::Slider::new(&mut self.cfg.concurrency, 1..=8));
+            ui.label(
+                egui::RichText::new("基础套餐填 1；额度足够可调大成倍提速")
+                    .color(pal::TEXT_WEAK)
+                    .small(),
+            );
+        });
+
+        // 工作流路径变了就重新解析节点/参数
+        self.reparse_workflow_if_changed();
+
+        // 拖入的附加图片提示
+        if !self.extra_files.is_empty() {
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(format!("➕ 已拖入 {} 张附加图片", self.extra_files.len()))
+                        .color(pal::ACCENT),
                 );
-                ui.end_row();
-
-                ui.label("工作流 ID");
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.cfg.workflow_id)
-                        .hint_text("网址 /workflow/ 后面那串数字")
-                        .desired_width(460.0),
-                );
-                ui.end_row();
-
-                ui.label("输入文件夹");
-                ui.horizontal(|ui| {
-                    ui.add(egui::TextEdit::singleline(&mut self.cfg.input_dir).desired_width(380.0));
-                    if ui.button("浏览…").clicked() {
-                        if let Some(p) = rfd::FileDialog::new().pick_folder() {
-                            self.cfg.input_dir = p.display().to_string();
-                        }
-                    }
-                });
-                ui.end_row();
-
-                ui.label("输出文件夹");
-                ui.horizontal(|ui| {
-                    ui.add(egui::TextEdit::singleline(&mut self.cfg.output_dir).desired_width(380.0));
-                    if ui.button("浏览…").clicked() {
-                        if let Some(p) = rfd::FileDialog::new().pick_folder() {
-                            self.cfg.output_dir = p.display().to_string();
-                        }
-                    }
-                });
-                ui.end_row();
-
-                ui.label("工作流 JSON");
-                ui.horizontal(|ui| {
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.cfg.workflow_json)
-                            .hint_text("用于自动识别输入/输出节点")
-                            .desired_width(380.0),
-                    );
-                    if ui.button("浏览…").clicked() {
-                        if let Some(p) =
-                            rfd::FileDialog::new().add_filter("json", &["json"]).pick_file()
-                        {
-                            self.cfg.workflow_json = p.display().to_string();
-                        }
-                    }
-                });
-                ui.end_row();
-
-                ui.label("并发数");
-                ui.add(egui::Slider::new(&mut self.cfg.concurrency, 1..=8));
-                ui.end_row();
+                if ui.small_button("清除").clicked() {
+                    self.extra_files.clear();
+                }
             });
+        }
 
         ui.checkbox(
             &mut self.cfg.skip_processed,
             "跳过已处理的图片（断点续跑）—— 取消勾选则全部重新处理",
         );
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut self.cfg.auto_open_output, "跑完自动打开输出文件夹");
+            ui.checkbox(&mut self.cfg.notify_sound, "完成提示音");
+        });
 
-        egui::CollapsingHeader::new("高级设置（节点 / 重试 / 超时）")
+        // —— 工作流参数（表单化）——
+        if !self.detected_params.is_empty() {
+            egui::CollapsingHeader::new(format!("工作流参数（{} 项，勾选“覆盖”才生效）", self.detected_params.len()))
+                .default_open(false)
+                .show(ui, |ui| self.params_form(ui));
+        }
+
+        egui::CollapsingHeader::new("高级设置（节点 / 重试 / 超时 / 预警）")
             .default_open(false)
             .show(ui, |ui| {
                 egui::Grid::new("adv")
@@ -720,6 +1367,13 @@ impl App {
                         ui.label("网络重试次数");
                         ui.add(egui::DragValue::new(&mut self.cfg.net_retry));
                         ui.end_row();
+                        ui.label("每张预估消耗(余额预警)");
+                        ui.add(
+                            egui::DragValue::new(&mut self.cfg.coins_per_image)
+                                .speed(0.1)
+                                .range(0.0..=1_000_000.0),
+                        );
+                        ui.end_row();
                     });
                 ui.checkbox(&mut self.cfg.add_metadata, "写入元数据 addMetadata");
                 ui.label("额外节点参数（JSON 数组，可选；例：固定种子）");
@@ -744,6 +1398,118 @@ impl App {
         }
     }
 
+    // 预设下拉 + 新建/重命名/删除
+    fn preset_bar(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("预设").color(pal::TEXT_WEAK).small());
+            let cur_name = self
+                .store
+                .presets
+                .get(self.store.current)
+                .map(|p| p.name.clone())
+                .unwrap_or_else(|| "默认".into());
+            let mut switch_to: Option<usize> = None;
+            egui::ComboBox::from_id_salt("preset_combo")
+                .selected_text(cur_name)
+                .show_ui(ui, |ui| {
+                    for (i, p) in self.store.presets.iter().enumerate() {
+                        if ui
+                            .selectable_label(i == self.store.current, &p.name)
+                            .clicked()
+                        {
+                            switch_to = Some(i);
+                        }
+                    }
+                });
+            if let Some(i) = switch_to {
+                if i != self.store.current {
+                    // 先把当前编辑写回旧预设，再切换
+                    let old = self.store.current;
+                    if let Some(p) = self.store.presets.get_mut(old) {
+                        p.cfg = self.cfg.clone();
+                    }
+                    self.store.current = i;
+                    self.cfg = self.store.presets[i].cfg.clone();
+                    self.parsed_wf.clear(); // 触发重新解析
+                    save_store(&self.store);
+                    self.refresh_account();
+                }
+            }
+
+            if ui.small_button("➕ 新建").clicked() {
+                // 当前编辑先写回，再新建一份默认
+                let old = self.store.current;
+                if let Some(p) = self.store.presets.get_mut(old) {
+                    p.cfg = self.cfg.clone();
+                }
+                let name = format!("预设 {}", self.store.presets.len() + 1);
+                self.store.presets.push(Preset {
+                    name,
+                    cfg: UiConfig::default(),
+                });
+                self.store.current = self.store.presets.len() - 1;
+                self.cfg = self.store.presets[self.store.current].cfg.clone();
+                self.parsed_wf.clear();
+                save_store(&self.store);
+            }
+            if ui.small_button("🗑 删除").clicked() && self.store.presets.len() > 1 {
+                let i = self.store.current;
+                self.store.presets.remove(i);
+                if self.store.current >= self.store.presets.len() {
+                    self.store.current = self.store.presets.len() - 1;
+                }
+                self.cfg = self.store.presets[self.store.current].cfg.clone();
+                self.parsed_wf.clear();
+                save_store(&self.store);
+            }
+
+            // 重命名
+            if let Some(p) = self.store.presets.get_mut(self.store.current) {
+                let resp = ui.add(
+                    egui::TextEdit::singleline(&mut p.name)
+                        .desired_width(140.0)
+                        .hint_text("预设名"),
+                );
+                if resp.lost_focus() {
+                    save_store(&self.store);
+                }
+            }
+        });
+    }
+
+    // 工作流参数表单
+    fn params_form(&mut self, ui: &mut egui::Ui) {
+        egui::Grid::new("params")
+            .num_columns(3)
+            .spacing([8.0, 6.0])
+            .show(ui, |ui| {
+                for (i, p) in self.detected_params.iter().enumerate() {
+                    let on = self.param_on.get_mut(i);
+                    if let Some(on) = on {
+                        ui.checkbox(on, "覆盖");
+                    }
+                    ui.label(
+                        egui::RichText::new(format!("{} · {}#{}", p.label, p.node_type, p.node_id))
+                            .color(pal::TEXT_WEAK)
+                            .small(),
+                    );
+                    let enabled = self.param_on.get(i).copied().unwrap_or(false);
+                    if let Some(val) = self.param_val.get_mut(i) {
+                        ui.add_enabled(
+                            enabled,
+                            egui::TextEdit::singleline(val).desired_width(220.0),
+                        );
+                    }
+                    ui.end_row();
+                }
+            });
+        ui.label(
+            egui::RichText::new("提示：种子留空/不覆盖=每次随机；勾选并填数字=固定。")
+                .color(pal::TEXT_WEAK)
+                .small(),
+        );
+    }
+
     fn list_panel(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new("图片列表").color(pal::TEXT).strong());
@@ -757,6 +1523,24 @@ impl App {
                 }
             });
         });
+
+        // 状态筛选
+        ui.horizontal_wrapped(|ui| {
+            for f in [
+                ListFilter::All,
+                ListFilter::Active,
+                ListFilter::Ok,
+                ListFilter::Skipped,
+                ListFilter::Failed,
+            ] {
+                if ui
+                    .selectable_label(self.list_filter == f, f.label())
+                    .clicked()
+                {
+                    self.list_filter = f;
+                }
+            }
+        });
         ui.add_space(6.0);
 
         if self.items.is_empty() {
@@ -765,7 +1549,7 @@ impl App {
                 ui.label(egui::RichText::new("🗂").size(30.0).color(pal::TEXT_WEAK));
                 ui.add_space(8.0);
                 ui.label(
-                    egui::RichText::new("填好参数后点“开始批量处理”")
+                    egui::RichText::new("填好参数后点“开始批量处理”，或把图片/文件夹拖进来")
                         .color(pal::TEXT_WEAK)
                         .small(),
                 );
@@ -773,43 +1557,111 @@ impl App {
             return;
         }
 
+        // 过滤出可见项（索引指向 items）
+        let visible: Vec<usize> = (0..self.items.len())
+            .filter(|&i| self.list_filter.matches(self.items[i].stage))
+            .collect();
+
+        if visible.is_empty() {
+            ui.add_space(20.0);
+            ui.vertical_centered(|ui| {
+                ui.label(
+                    egui::RichText::new("该筛选下没有图片")
+                        .color(pal::TEXT_WEAK)
+                        .small(),
+                );
+            });
+            return;
+        }
+
+        let row_h = 64.0;
         let mut clicked: Option<usize> = None;
+        let mut to_decode: Vec<(usize, PathBuf)> = Vec::new();
         egui::ScrollArea::vertical()
             .id_salt("list_scroll")
             .auto_shrink([false, false])
-            .show(ui, |ui| {
-                for i in 0..self.items.len() {
-                    let (name, stage, detail) = {
-                        let it = &self.items[i];
-                        (it.name.clone(), it.stage, it.detail.clone())
-                    };
+            .show_rows(ui, row_h, visible.len(), |ui, range| {
+                for vi in range {
+                    let i = visible[vi];
                     let selected = self.selected == Some(i);
-                    let w = ui.available_width();
-                    let resp = ui.add_sized(
-                        [w, 26.0],
-                        egui::Button::selectable(
-                            selected,
-                            egui::RichText::new(&name).color(pal::TEXT),
-                        ),
-                    );
-                    ui.horizontal(|ui| {
-                        ui.add_space(4.0);
-                        stage_chip(ui, stage);
-                        if stage.is_active() && !detail.is_empty() {
-                            ui.label(
-                                egui::RichText::new(&detail).color(pal::TEXT_WEAK).small(),
-                            );
+                    let (name, stage, detail, has_thumb) = {
+                        let it = &self.items[i];
+                        (it.name.clone(), it.stage, it.detail.clone(), it.list_tex.is_some())
+                    };
+                    // 懒解码列表缩略图
+                    if !has_thumb {
+                        let it = &mut self.items[i];
+                        if !it.list_req {
+                            it.list_req = true;
+                            to_decode.push((i, it.input.clone()));
                         }
+                    }
+
+                    // 整行可点：用 Frame 画选中底色 + 非交互内容，避免内部控件吞掉点击
+                    let bg = if selected {
+                        tint(pal::ACCENT, 36)
+                    } else {
+                        egui::Color32::TRANSPARENT
+                    };
+                    let inner = egui::Frame {
+                        inner_margin: egui::Margin::symmetric(6, 4),
+                        outer_margin: egui::Margin::same(0),
+                        fill: bg,
+                        stroke: egui::Stroke::NONE,
+                        corner_radius: egui::CornerRadius::same(8),
+                        shadow: egui::Shadow::NONE,
+                    }
+                    .show(ui, |ui| {
+                        ui.set_min_width(ui.available_width());
+                        ui.spacing_mut().item_spacing.y = 2.0;
+                        ui.horizontal(|ui| {
+                            let thumb_sz = egui::vec2(42.0, 42.0);
+                            if let Some(t) = &self.items[i].list_tex {
+                                ui.add(
+                                    egui::Image::new(t)
+                                        .fit_to_exact_size(thumb_sz)
+                                        .corner_radius(6.0),
+                                );
+                            } else {
+                                let (r, _) =
+                                    ui.allocate_exact_size(thumb_sz, egui::Sense::hover());
+                                ui.painter()
+                                    .rect_filled(r, egui::CornerRadius::same(6), pal::FIELD);
+                            }
+                            ui.add_space(6.0);
+                            ui.vertical(|ui| {
+                                let nm = egui::RichText::new(&name).color(pal::TEXT);
+                                ui.label(if selected { nm.strong() } else { nm });
+                                ui.horizontal(|ui| {
+                                    stage_chip(ui, stage);
+                                    if stage.is_active() && !detail.is_empty() {
+                                        ui.label(
+                                            egui::RichText::new(&detail)
+                                                .color(pal::TEXT_WEAK)
+                                                .small(),
+                                        );
+                                    }
+                                });
+                            });
+                        });
                     });
+                    let resp = inner.response.interact(egui::Sense::click());
+                    if resp.hovered() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                    }
                     if resp.clicked() {
                         clicked = Some(i);
                     }
-                    ui.add_space(6.0);
                 }
             });
+
+        for (i, path) in to_decode {
+            spawn_decode(self.tx.clone(), ui.ctx().clone(), i, Which::List, path, LIST_THUMB_MAX);
+        }
         if let Some(i) = clicked {
             self.selected = Some(i);
             self.follow = false;
+            self.reset_compare_view();
         }
     }
 
@@ -849,43 +1701,62 @@ impl App {
             if stage.is_active() && !detail.is_empty() {
                 ui.label(egui::RichText::new(&detail).color(pal::TEXT_WEAK).small());
             }
-        });
-        ui.add_space(10.0);
-
-        let avail_w = ui.available_width();
-        let avail_h = ui.available_height();
-        let cell = egui::vec2((avail_w / 2.0 - 44.0).max(120.0), (avail_h - 92.0).max(160.0));
-
-        ui.columns(2, |cols| {
-            preview_cell(&mut cols[0], "处理前 · 原图", &in_tex, cell, |ui| {
-                ui.spinner();
-                ui.label(egui::RichText::new("加载中…").color(pal::TEXT_WEAK).small());
-            });
-            preview_cell(&mut cols[1], "处理后 · 结果", &out_tex, cell, |ui| {
-                if has_out {
-                    ui.spinner();
-                    ui.label(egui::RichText::new("加载中…").color(pal::TEXT_WEAK).small());
-                } else {
-                    match stage {
-                        Stage::Failed => {
-                            ui.label(egui::RichText::new("✗ 处理失败").color(pal::ERROR));
-                        }
-                        Stage::Skipped => {
-                            ui.label(egui::RichText::new("已跳过").color(pal::WARN));
-                        }
-                        Stage::Done => {
-                            ui.label(egui::RichText::new("无输出").color(pal::TEXT_WEAK));
-                        }
-                        _ => {
-                            ui.spinner();
-                            ui.label(
-                                egui::RichText::new("尚未生成…").color(pal::TEXT_WEAK).small(),
-                            );
-                        }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                // 模式切换
+                if ui
+                    .selectable_label(self.cmp_mode == CmpMode::Wipe, "滑动对比")
+                    .clicked()
+                {
+                    self.cmp_mode = CmpMode::Wipe;
+                }
+                if ui
+                    .selectable_label(self.cmp_mode == CmpMode::Side, "并排")
+                    .clicked()
+                {
+                    self.cmp_mode = CmpMode::Side;
+                }
+                if self.cmp_mode == CmpMode::Wipe {
+                    if ui.button("1:1").clicked() {
+                        self.set_one_to_one(&out_tex, &in_tex);
                     }
+                    if ui.button("适应").clicked() {
+                        self.reset_compare_view();
+                    }
+                    ui.label(
+                        egui::RichText::new(format!("{:.0}%", self.cmp_zoom * 100.0))
+                            .color(pal::TEXT_WEAK)
+                            .small(),
+                    );
                 }
             });
         });
+        ui.add_space(10.0);
+
+        match self.cmp_mode {
+            CmpMode::Side => {
+                let avail_w = ui.available_width();
+                let avail_h = ui.available_height();
+                let cell =
+                    egui::vec2((avail_w / 2.0 - 44.0).max(120.0), (avail_h - 92.0).max(160.0));
+                ui.columns(2, |cols| {
+                    preview_cell(&mut cols[0], "处理前 · 原图", &in_tex, cell, |ui| {
+                        ui.spinner();
+                        ui.label(egui::RichText::new("加载中…").color(pal::TEXT_WEAK).small());
+                    });
+                    preview_cell(&mut cols[1], "处理后 · 结果", &out_tex, cell, |ui| {
+                        if has_out {
+                            ui.spinner();
+                            ui.label(egui::RichText::new("加载中…").color(pal::TEXT_WEAK).small());
+                        } else {
+                            empty_after(ui, stage);
+                        }
+                    });
+                });
+            }
+            CmpMode::Wipe => {
+                self.wipe_viewer(ui, &in_tex, &out_tex, has_out, stage);
+            }
+        }
 
         ui.add_space(10.0);
         ui.horizontal(|ui| {
@@ -907,6 +1778,163 @@ impl App {
         });
     }
 
+    // 1:1 像素查看：让纹理按自身像素 1 texel = 1 屏幕像素显示。
+    // 预览纹理已是全分辨率（按 GPU 纹理上限夹紧），所以这是真实像素视图，
+    // 放大/精修的细节可直接在此评估，无需再打开外部看图器。
+    fn set_one_to_one(
+        &mut self,
+        out_tex: &Option<egui::TextureHandle>,
+        in_tex: &Option<egui::TextureHandle>,
+    ) {
+        self.cmp_offset = egui::Vec2::ZERO;
+        if let Some(t) = out_tex.as_ref().or(in_tex.as_ref()) {
+            let tw = t.size_vec2().x;
+            if self.cmp_fit_w > 1.0 {
+                self.cmp_zoom = (tw / self.cmp_fit_w).clamp(0.2, 12.0);
+                return;
+            }
+        }
+        self.cmp_zoom = 1.0;
+    }
+
+    // 滑动对比 + 缩放/平移
+    fn wipe_viewer(
+        &mut self,
+        ui: &mut egui::Ui,
+        in_tex: &Option<egui::TextureHandle>,
+        out_tex: &Option<egui::TextureHandle>,
+        has_out: bool,
+        stage: Stage,
+    ) {
+        let avail = egui::vec2(ui.available_width(), (ui.available_height() - 56.0).max(160.0));
+        let (rect, resp) = ui.allocate_exact_size(avail, egui::Sense::click_and_drag());
+        let painter = ui.painter_at(rect);
+        painter.rect_filled(rect, egui::CornerRadius::same(8), pal::SURFACE);
+        painter.rect_stroke(
+            rect,
+            egui::CornerRadius::same(8),
+            egui::Stroke::new(1.0, pal::STROKE),
+            egui::StrokeKind::Inside,
+        );
+
+        // 没有结果图就退化成只看原图 / 提示
+        let (Some(itex), otex) = (in_tex.as_ref(), out_tex.as_ref()) else {
+            ui.painter().text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "加载中…",
+                egui::FontId::proportional(14.0),
+                pal::TEXT_WEAK,
+            );
+            return;
+        };
+        if otex.is_none() && !has_out {
+            // 原图已有，但无结果：左半画原图，右半给状态文字
+            let base = fit_rect(rect, tex_aspect(itex));
+            self.cmp_fit_w = base.width();
+            let draw = scaled_rect(base, rect.center() + self.cmp_offset, self.cmp_zoom);
+            painter.image(itex.id(), draw, uv_full(), egui::Color32::WHITE);
+            empty_after_painter(&painter, rect, stage);
+            self.handle_zoom_pan(ui, &resp, rect);
+            return;
+        }
+        let Some(otex) = otex else {
+            // 结果还在解码
+            ui.painter().text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "结果加载中…",
+                egui::FontId::proportional(14.0),
+                pal::TEXT_WEAK,
+            );
+            return;
+        };
+
+        // 缩放/平移交互（拖动分割线优先）
+        let divider_x = rect.left() + self.cmp_wipe * rect.width();
+        if resp.drag_started() {
+            if let Some(pos) = resp.interact_pointer_pos() {
+                self.cmp_drag_wipe = (pos.x - divider_x).abs() < 12.0;
+            }
+        }
+        if resp.dragged() {
+            if self.cmp_drag_wipe {
+                if let Some(pos) = resp.interact_pointer_pos() {
+                    self.cmp_wipe = ((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
+                }
+            } else {
+                self.cmp_offset += resp.drag_delta();
+            }
+        }
+        if resp.drag_stopped() {
+            self.cmp_drag_wipe = false;
+        }
+        self.handle_zoom_pan(ui, &resp, rect);
+
+        // 用 out 的宽高比作为基准，两图叠到同一显示矩形
+        let base = fit_rect(rect, tex_aspect(otex));
+        self.cmp_fit_w = base.width();
+        let draw = scaled_rect(base, rect.center() + self.cmp_offset, self.cmp_zoom);
+        let divider_x = rect.left() + self.cmp_wipe * rect.width();
+
+        // 左半：原图
+        let left_clip = egui::Rect::from_min_max(
+            rect.left_top(),
+            egui::pos2(divider_x, rect.bottom()),
+        );
+        painter
+            .with_clip_rect(left_clip)
+            .image(itex.id(), draw, uv_full(), egui::Color32::WHITE);
+        // 右半：结果
+        let right_clip = egui::Rect::from_min_max(
+            egui::pos2(divider_x, rect.top()),
+            rect.right_bottom(),
+        );
+        painter
+            .with_clip_rect(right_clip)
+            .image(otex.id(), draw, uv_full(), egui::Color32::WHITE);
+
+        // 分割线 + 手柄
+        painter.line_segment(
+            [egui::pos2(divider_x, rect.top()), egui::pos2(divider_x, rect.bottom())],
+            egui::Stroke::new(2.0, pal::ACCENT),
+        );
+        painter.circle_filled(egui::pos2(divider_x, rect.center().y), 7.0, pal::ACCENT);
+        // 角标
+        painter.text(
+            rect.left_top() + egui::vec2(8.0, 8.0),
+            egui::Align2::LEFT_TOP,
+            "原图",
+            egui::FontId::proportional(12.0),
+            pal::TEXT_WEAK,
+        );
+        painter.text(
+            rect.right_top() + egui::vec2(-8.0, 8.0),
+            egui::Align2::RIGHT_TOP,
+            "结果",
+            egui::FontId::proportional(12.0),
+            pal::ACCENT_DK,
+        );
+
+        if resp.hovered() {
+            ui.ctx().set_cursor_icon(if self.cmp_drag_wipe {
+                egui::CursorIcon::ResizeHorizontal
+            } else {
+                egui::CursorIcon::Grab
+            });
+        }
+    }
+
+    fn handle_zoom_pan(&mut self, ui: &mut egui::Ui, resp: &egui::Response, _rect: egui::Rect) {
+        if resp.hovered() {
+            let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+            if scroll.abs() > 0.0 {
+                let factor = (scroll * 0.0015).exp();
+                self.cmp_zoom = (self.cmp_zoom * factor).clamp(0.2, 12.0);
+            }
+        }
+    }
+
     fn log_panel(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new("日志").color(pal::TEXT).strong());
@@ -917,29 +1945,80 @@ impl App {
                         .small(),
                 );
             }
+            // 级别过滤
+            egui::ComboBox::from_id_salt("log_filter")
+                .selected_text(self.log_filter.label())
+                .width(72.0)
+                .show_ui(ui, |ui| {
+                    for f in [
+                        LogFilter::All,
+                        LogFilter::Info,
+                        LogFilter::Success,
+                        LogFilter::Warn,
+                        LogFilter::Error,
+                    ] {
+                        ui.selectable_value(&mut self.log_filter, f, f.label());
+                    }
+                });
+            ui.add(
+                egui::TextEdit::singleline(&mut self.log_search)
+                    .hint_text("搜索…")
+                    .desired_width(160.0),
+            );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.button("清空").clicked() {
                     self.logs.clear();
                 }
+                if ui.button("导出").clicked() {
+                    self.export_logs();
+                }
             });
         });
         ui.add_space(4.0);
+        let search = self.log_search.to_lowercase();
         egui::ScrollArea::vertical()
             .id_salt("logs_scroll")
             .stick_to_bottom(true)
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 for line in &self.logs {
+                    if !log_matches_filter(line, self.log_filter) {
+                        continue;
+                    }
+                    if !search.is_empty() && !line.to_lowercase().contains(&search) {
+                        continue;
+                    }
                     ui.label(egui::RichText::new(line).monospace().color(log_color(line)));
                 }
             });
     }
+
+    fn export_logs(&mut self) {
+        let default = "vc_batch_log.txt";
+        if let Some(path) = rfd::FileDialog::new()
+            .set_file_name(default)
+            .add_filter("text", &["txt"])
+            .save_file()
+        {
+            match std::fs::write(&path, self.logs.join("\r\n")) {
+                Ok(()) => self.logs.push(format!("📝 日志已导出：{}", path.display())),
+                Err(e) => self.logs.push(format!("⚠ 日志导出失败：{e}")),
+            }
+        }
+    }
 }
 
 // ============ 缩略图解码（后台线程）============
-fn spawn_decode(tx: Sender<Msg>, ctx: egui::Context, idx: usize, which: Which, path: PathBuf) {
+fn spawn_decode(
+    tx: Sender<Msg>,
+    ctx: egui::Context,
+    idx: usize,
+    which: Which,
+    path: PathBuf,
+    max: u32,
+) {
     std::thread::spawn(move || {
-        match decode_thumb(&path) {
+        match decode_thumb(&path, max) {
             Ok((w, h, rgba)) => {
                 let _ = tx.send(Msg::Thumb { idx, which, w, h, rgba });
             }
@@ -951,11 +2030,11 @@ fn spawn_decode(tx: Sender<Msg>, ctx: egui::Context, idx: usize, which: Which, p
     });
 }
 
-fn decode_thumb(path: &Path) -> anyhow::Result<(usize, usize, Vec<u8>)> {
+fn decode_thumb(path: &Path, max: u32) -> anyhow::Result<(usize, usize, Vec<u8>)> {
     let img = image::ImageReader::open(path)?
         .with_guessed_format()?
         .decode()?;
-    let img = img.thumbnail(THUMB_MAX, THUMB_MAX); // 等比快速缩放
+    let img = img.thumbnail(max, max); // 等比快速缩放
     let rgba = img.to_rgba8();
     let (w, h) = (rgba.width() as usize, rgba.height() as usize);
     Ok((w, h, rgba.into_raw()))
@@ -979,6 +2058,41 @@ fn parse_extra_overrides(text: &str) -> Result<Vec<serde_json::Value>, String> {
         serde_json::Value::Array(a) => Ok(a),
         _ => Err("必须是 JSON 数组，例如 [{...}]".into()),
     }
+}
+
+// 把工作流里的当前值转成编辑框初值字符串。
+fn json_value_to_edit(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Number(n) => n.to_string(),
+        serde_json::Value::Bool(b) => b.to_string(),
+        other => other.to_string(),
+    }
+}
+
+// 把编辑框字符串按原值类型转回 JSON 值。
+fn edit_to_json_value(s: &str, original: &serde_json::Value) -> serde_json::Value {
+    match original {
+        serde_json::Value::Number(_) => {
+            if let Ok(i) = s.trim().parse::<i64>() {
+                serde_json::json!(i)
+            } else if let Ok(f) = s.trim().parse::<f64>() {
+                serde_json::json!(f)
+            } else {
+                serde_json::Value::String(s.to_string())
+            }
+        }
+        serde_json::Value::Bool(_) => match s.trim().to_lowercase().as_str() {
+            "true" | "1" => serde_json::json!(true),
+            "false" | "0" => serde_json::json!(false),
+            _ => serde_json::Value::String(s.to_string()),
+        },
+        _ => serde_json::Value::String(s.to_string()),
+    }
+}
+
+fn coins_value(a: &AccountInfo) -> Option<f64> {
+    a.remain_coins.as_ref().and_then(|s| s.trim().parse::<f64>().ok())
 }
 
 fn resolve_workflow_path(name: &str) -> PathBuf {
@@ -1013,6 +2127,20 @@ fn open_file(path: &Path) {
     }
 }
 
+// 完成提示音（Windows MessageBeep，无新依赖）。
+#[cfg(windows)]
+fn notify_beep() {
+    #[link(name = "user32")]
+    extern "system" {
+        fn MessageBeep(u_type: u32) -> i32;
+    }
+    unsafe {
+        let _ = MessageBeep(0x00000040); // MB_ICONASTERISK
+    }
+}
+#[cfg(not(windows))]
+fn notify_beep() {}
+
 // ============ 后台批处理（线程池）============
 fn run_batch(b: BatchConfig, tx: Sender<Msg>, stop: Arc<AtomicBool>, ctx: egui::Context) {
     let log = |s: String| {
@@ -1043,74 +2171,127 @@ fn run_batch(b: BatchConfig, tx: Sender<Msg>, stop: Arc<AtomicBool>, ctx: egui::
     if acc.current_task_counts.is_some() || acc.remain_coins.is_some() {
         log(format!(
             "账户状态：currentTaskCounts={}  remainCoins={}",
-            acc.current_task_counts.unwrap_or_else(|| "?".into()),
-            acc.remain_coins.unwrap_or_else(|| "?".into())
+            acc.current_task_counts.clone().unwrap_or_else(|| "?".into()),
+            acc.remain_coins.clone().unwrap_or_else(|| "?".into())
         ));
     }
 
-    // 收集图片
-    let mut files: Vec<PathBuf> = Vec::new();
-    match std::fs::read_dir(&b.cfg.input_dir) {
-        Ok(rd) => {
-            for e in rd.flatten() {
-                let p = e.path();
-                if p.is_file() {
-                    if let Some(ext) = p.extension().and_then(|s| s.to_str()) {
-                        if IMAGE_EXTS.contains(&ext.to_lowercase().as_str()) {
-                            files.push(p);
+    // 构造任务队列（带 UI 索引）
+    let jobs: Vec<(usize, PathBuf)> = match &b.mode {
+        RunMode::Subset(subset) => {
+            // 重置这些项的状态
+            for (idx, _) in subset {
+                let _ = tx.send(Msg::Stage {
+                    idx: *idx,
+                    stage: Stage::Queued,
+                    detail: String::new(),
+                });
+            }
+            log(format!("↻ 重跑 {} 项…", subset.len()));
+            subset.clone()
+        }
+        RunMode::Full { extra } => {
+            // 收集输入目录图片 + 拖入的附加图片
+            let mut files: Vec<PathBuf> = Vec::new();
+            if !b.cfg.input_dir.trim().is_empty() {
+                match std::fs::read_dir(&b.cfg.input_dir) {
+                    Ok(rd) => {
+                        for e in rd.flatten() {
+                            let p = e.path();
+                            if p.is_file() {
+                                if let Some(ext) = p.extension().and_then(|s| s.to_str()) {
+                                    if IMAGE_EXTS.contains(&ext.to_lowercase().as_str()) {
+                                        files.push(p);
+                                    }
+                                }
+                            }
                         }
+                    }
+                    Err(e) => {
+                        log(format!("⚠ 无法读取输入文件夹：{e}（仅处理拖入的图片）"));
                     }
                 }
             }
-        }
-        Err(e) => {
-            log(format!("❌ 无法读取输入文件夹：{e}"));
-            let _ = tx.send(Msg::Finished);
+            for p in extra {
+                if p.is_file() && !files.contains(p) {
+                    files.push(p.clone());
+                }
+            }
+            files.sort();
+            files.dedup();
+            let total = files.len();
+            if total == 0 {
+                log("❌ 没有可处理的图片（支持 png/jpg/jpeg/webp/bmp）".into());
+                let _ = tx.send(Msg::Finished);
+                ctx.request_repaint();
+                return;
+            }
+            let _ = std::fs::create_dir_all(&b.cfg.output_dir);
+
+            // 余额预警（按每张预估消耗）
+            if b.cfg.coins_per_image > 0.0 {
+                if let Some(bal) = acc.remain_coins.as_ref().and_then(|s| s.trim().parse::<f64>().ok())
+                {
+                    let pending = if b.cfg.skip_processed {
+                        files
+                            .iter()
+                            .filter(|p| {
+                                let name = p
+                                    .file_stem()
+                                    .and_then(|s| s.to_str())
+                                    .unwrap_or("img");
+                                existing_outputs(&b.cfg.output_dir, name).is_empty()
+                            })
+                            .count()
+                    } else {
+                        total
+                    };
+                    let need = pending as f64 * b.cfg.coins_per_image;
+                    if need > bal {
+                        log(format!(
+                            "⚠ 余额预警：待处理约 {pending} 张 × {:.2} = {:.2}，超过当前余额 {:.2}，可能中途用尽。",
+                            b.cfg.coins_per_image, need, bal
+                        ));
+                    }
+                }
+            }
+
+            // 先把完整列表发给 UI
+            let list: Vec<(String, PathBuf)> = files
+                .iter()
+                .map(|p| {
+                    let name = p
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("img")
+                        .to_string();
+                    (name, p.clone())
+                })
+                .collect();
+            let _ = tx.send(Msg::Files(list));
             ctx.request_repaint();
-            return;
+            log(format!(
+                "共 {} 张待处理，并发 {}，输出到：{}",
+                total, b.cfg.concurrency, b.cfg.output_dir
+            ));
+            log(format!(
+                "断点续跑：{}",
+                if b.cfg.skip_processed {
+                    "开启（已有结果的图片将自动跳过）"
+                } else {
+                    "关闭（全部重新处理）"
+                }
+            ));
+            files.into_iter().enumerate().collect()
         }
-    }
-    files.sort();
-    let total = files.len();
-    if total == 0 {
-        log("❌ 输入文件夹里没有图片（支持 png/jpg/jpeg/webp/bmp）".into());
-        let _ = tx.send(Msg::Finished);
-        ctx.request_repaint();
-        return;
-    }
-    let _ = std::fs::create_dir_all(&b.cfg.output_dir);
+    };
 
-    // 先把完整列表发给 UI
-    let list: Vec<(String, PathBuf)> = files
-        .iter()
-        .map(|p| {
-            let name = p
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("img")
-                .to_string();
-            (name, p.clone())
-        })
-        .collect();
-    let _ = tx.send(Msg::Files(list));
-    ctx.request_repaint();
-    log(format!(
-        "共 {} 张待处理，并发 {}，输出到：{}",
-        total, b.cfg.concurrency, b.cfg.output_dir
-    ));
-    log(format!(
-        "断点续跑：{}",
-        if b.cfg.skip_processed {
-            "开启（已有结果的图片将自动跳过）"
-        } else {
-            "关闭（全部重新处理）"
-        }
-    ));
+    // 子集重跑强制处理（忽略断点续跑）
+    let force = matches!(b.mode, RunMode::Subset(_));
 
-    // 任务队列（带索引）
     let (jtx, jrx) = crossbeam_channel::unbounded::<(usize, PathBuf)>();
-    for (i, f) in files.into_iter().enumerate() {
-        let _ = jtx.send((i, f));
+    for j in jobs {
+        let _ = jtx.send(j);
     }
     drop(jtx);
 
@@ -1124,7 +2305,6 @@ fn run_batch(b: BatchConfig, tx: Sender<Msg>, stop: Arc<AtomicBool>, ctx: egui::
         let client = client.clone();
         let b = b.clone();
         handles.push(std::thread::spawn(move || {
-            let mut results: Vec<ProcessResult> = Vec::new();
             while let Ok((idx, path)) = jrx.recv() {
                 if stop.load(Ordering::SeqCst) {
                     break;
@@ -1134,15 +2314,15 @@ fn run_batch(b: BatchConfig, tx: Sender<Msg>, stop: Arc<AtomicBool>, ctx: egui::
                     .and_then(|s| s.to_str())
                     .unwrap_or("img")
                     .to_string();
-                let input_str = path.display().to_string();
 
-                // 断点续跑：已有结果则跳过，并把已存在的结果回显到“处理后”，方便直接对比
-                if b.cfg.skip_processed {
+                // 断点续跑：已有结果则跳过（子集强制重跑时不跳过）
+                if b.cfg.skip_processed && !force {
                     let existing = existing_outputs(&b.cfg.output_dir, &name);
                     if !existing.is_empty() {
                         let _ = tx.send(Msg::Outputs {
                             idx,
                             paths: existing.clone(),
+                            task_id: String::new(),
                         });
                         let _ = tx.send(Msg::Stage {
                             idx,
@@ -1150,16 +2330,6 @@ fn run_batch(b: BatchConfig, tx: Sender<Msg>, stop: Arc<AtomicBool>, ctx: egui::
                             detail: "已存在结果".into(),
                         });
                         let _ = tx.send(Msg::Log(format!("⏭ 跳过（已存在）：{name}")));
-                        results.push(ProcessResult {
-                            input: input_str,
-                            status: "skipped".into(),
-                            task_id: String::new(),
-                            outputs: existing
-                                .iter()
-                                .map(|p| p.display().to_string())
-                                .collect::<Vec<_>>()
-                                .join(";"),
-                        });
                         ctx.request_repaint();
                         continue;
                     }
@@ -1170,6 +2340,7 @@ fn run_batch(b: BatchConfig, tx: Sender<Msg>, stop: Arc<AtomicBool>, ctx: egui::
                         let _ = tx.send(Msg::Outputs {
                             idx,
                             paths: paths.clone(),
+                            task_id: task_id.clone(),
                         });
                         let _ = tx.send(Msg::Stage {
                             idx,
@@ -1177,16 +2348,6 @@ fn run_batch(b: BatchConfig, tx: Sender<Msg>, stop: Arc<AtomicBool>, ctx: egui::
                             detail: format!("{} 张结果", paths.len()),
                         });
                         let _ = tx.send(Msg::Log(format!("✓ 完成：{name} → {} 张", paths.len())));
-                        results.push(ProcessResult {
-                            input: input_str,
-                            status: if paths.is_empty() { "no_output" } else { "ok" }.into(),
-                            task_id,
-                            outputs: paths
-                                .iter()
-                                .map(|p| p.display().to_string())
-                                .collect::<Vec<_>>()
-                                .join(";"),
-                        });
                     }
                     Err(e) => {
                         let _ = tx.send(Msg::Stage {
@@ -1195,50 +2356,24 @@ fn run_batch(b: BatchConfig, tx: Sender<Msg>, stop: Arc<AtomicBool>, ctx: egui::
                             detail: e.to_string(),
                         });
                         let _ = tx.send(Msg::Log(format!("✗ 失败：{name}：{e}")));
-                        results.push(ProcessResult {
-                            input: input_str,
-                            status: format!("error: {e}"),
-                            task_id: String::new(),
-                            outputs: String::new(),
-                        });
                     }
                 }
                 ctx.request_repaint();
             }
-            results
         }));
     }
-    let mut all_results: Vec<ProcessResult> = Vec::new();
     for h in handles {
-        if let Ok(mut r) = h.join() {
-            all_results.append(&mut r);
-        }
+        let _ = h.join();
     }
 
-    match write_manifest(&b.cfg.output_dir, &all_results) {
-        Ok(path) => log(format!("清单已写入：{path}")),
-        Err(e) => log(format!("⚠ 写清单失败：{e}")),
-    }
-
-    let ok = all_results.iter().filter(|r| r.status == "ok").count();
-    let sk = all_results.iter().filter(|r| r.status == "skipped").count();
-    let bad = all_results.len() - ok - sk;
     let stopped = stop.load(Ordering::SeqCst);
     log(format!(
-        "{}全部完成：成功 {ok}，跳过 {sk}，失败/无输出 {bad}。",
+        "{}本轮结束。",
         if stopped { "⏹ 已停止，" } else { "" }
     ));
 
     let _ = tx.send(Msg::Finished);
     ctx.request_repaint();
-}
-
-#[derive(Clone)]
-struct ProcessResult {
-    input: String,
-    status: String,
-    task_id: String,
-    outputs: String,
 }
 
 /// 返回输出目录里属于该图的已存在结果文件（命名 `原名_rh*`）。
@@ -1267,18 +2402,37 @@ fn csv_field(s: &str) -> String {
     }
 }
 
-fn write_manifest(out_dir: &str, results: &[ProcessResult]) -> std::io::Result<String> {
+// 从 UI items 汇总清单：全量 + 子集重跑后都正确。
+fn write_manifest(out_dir: &str, items: &[Item]) -> std::io::Result<String> {
     let path = Path::new(out_dir).join("_manifest.csv");
     let mut s = String::from("\u{feff}");
     s.push_str("input,status,task_id,outputs\n");
-    for r in results {
-        s.push_str(&csv_field(&r.input));
+    for it in items {
+        let status = match it.stage {
+            Stage::Done => {
+                if it.outputs.is_empty() {
+                    "no_output".to_string()
+                } else {
+                    "ok".to_string()
+                }
+            }
+            Stage::Skipped => "skipped".to_string(),
+            Stage::Failed => format!("error: {}", it.detail),
+            _ => "pending".to_string(),
+        };
+        let outputs = it
+            .outputs
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(";");
+        s.push_str(&csv_field(&it.input.display().to_string()));
         s.push(',');
-        s.push_str(&csv_field(&r.status));
+        s.push_str(&csv_field(&status));
         s.push(',');
-        s.push_str(&csv_field(&r.task_id));
+        s.push_str(&csv_field(&it.task_id));
         s.push(',');
-        s.push_str(&csv_field(&r.outputs));
+        s.push_str(&csv_field(&outputs));
         s.push('\n');
     }
     std::fs::write(&path, s)?;
@@ -1428,10 +2582,11 @@ fn process_one(
 
 // ============ main ============
 fn main() -> Result<(), eframe::Error> {
+    let store = load_store();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title(APP_TITLE)
-            .with_inner_size([1180.0, 800.0])
+            .with_inner_size([store.win_w, store.win_h])
             .with_min_inner_size([880.0, 600.0]),
         ..Default::default()
     };
@@ -1442,7 +2597,7 @@ fn main() -> Result<(), eframe::Error> {
     )
 }
 
-// 现代深色主题：字体（含中文）、字号、间距、配色、圆角、阴影。
+// 现代浅色主题：字体（含中文）、字号、间距、配色、圆角、阴影。
 fn apply_theme(ctx: &egui::Context) {
     setup_cjk_font(ctx);
 
@@ -1459,19 +2614,20 @@ fn apply_theme(ctx: &egui::Context) {
     .into();
 
     let sp = &mut style.spacing;
-    sp.item_spacing = egui::vec2(10.0, 10.0);
-    sp.button_padding = egui::vec2(14.0, 7.0);
-    sp.interact_size.y = 30.0;
+    sp.item_spacing = egui::vec2(10.0, 9.0);
+    sp.button_padding = egui::vec2(14.0, 8.0);
+    sp.interact_size.y = 32.0; // 更舒适的输入框/按钮高度
     sp.slider_width = 180.0;
     sp.menu_margin = egui::Margin::same(8);
     sp.indent = 18.0;
+    sp.text_edit_width = 320.0;
 
     let r = egui::CornerRadius::same(9);
-    let mk = |bg: egui::Color32, weak: egui::Color32, stroke: egui::Color32, fg: egui::Color32, exp: f32| {
+    let mk = |bg: egui::Color32, weak: egui::Color32, stroke: egui::Color32, sw: f32, fg: egui::Color32, exp: f32| {
         egui::style::WidgetVisuals {
             bg_fill: bg,
             weak_bg_fill: weak,
-            bg_stroke: egui::Stroke::new(1.0, stroke),
+            bg_stroke: egui::Stroke::new(sw, stroke),
             corner_radius: r,
             fg_stroke: egui::Stroke::new(1.0, fg),
             expansion: exp,
@@ -1505,16 +2661,19 @@ fn apply_theme(ctx: &egui::Context) {
     };
     v.menu_corner_radius = egui::CornerRadius::same(10);
     v.selection.bg_fill = egui::Color32::from_rgba_unmultiplied(13, 148, 136, 48);
-    v.selection.stroke = egui::Stroke::new(1.0, pal::ACCENT);
+    v.selection.stroke = egui::Stroke::new(1.6, pal::ACCENT); // 聚焦时清晰的青绿描边
     v.slider_trailing_fill = true;
     v.handle_shape = egui::style::HandleShape::Circle;
     v.image_loading_spinners = true;
 
-    v.widgets.noninteractive = mk(pal::SURFACE, pal::SURFACE, pal::STROKE, pal::TEXT, 0.0);
-    v.widgets.inactive = mk(pal::SURFACE, pal::BTN, pal::STROKE, pal::TEXT, 0.0);
-    v.widgets.hovered = mk(pal::SURFACE_HI, pal::BTN_HI, pal::STROKE_HI, pal::TEXT, 1.0);
-    v.widgets.active = mk(pal::ACCENT_DK, pal::ACCENT_DK, pal::ACCENT_DK, pal::ON_ACCENT, 1.0);
-    v.widgets.open = mk(pal::SURFACE_HI, pal::BTN_HI, pal::STROKE_HI, pal::TEXT, 0.0);
+    // 输入框背景：白卡上用浅灰底，配合清晰边框，明显是“可输入”
+    v.text_edit_bg_color = Some(pal::FIELD);
+    // 静态：1.2px 中灰边框，输入框/按钮都有清晰边界；悬停/聚焦更明显
+    v.widgets.noninteractive = mk(pal::SURFACE, pal::SURFACE, pal::STROKE, 1.0, pal::TEXT, 0.0);
+    v.widgets.inactive = mk(pal::SURFACE, pal::BTN, pal::STROKE_HI, 1.2, pal::TEXT, 0.0);
+    v.widgets.hovered = mk(pal::SURFACE_HI, pal::BTN_HI, pal::STROKE_STRONG, 1.4, pal::TEXT, 1.0);
+    v.widgets.active = mk(pal::ACCENT_DK, pal::ACCENT_DK, pal::ACCENT_DK, 1.4, pal::ON_ACCENT, 1.0);
+    v.widgets.open = mk(pal::SURFACE_HI, pal::BTN_HI, pal::STROKE_STRONG, 1.2, pal::TEXT, 0.0);
 
     style.visuals = v;
     ctx.set_global_style(style);
@@ -1547,6 +2706,32 @@ fn panel_frame(fill: egui::Color32, mx: i8, my: i8, shadow: egui::Shadow) -> egu
         corner_radius: egui::CornerRadius::ZERO,
         shadow,
     }
+}
+
+// 设置表单左侧固定宽度、左对齐标签，保证各行输入框左边缘对齐。
+fn field_label(ui: &mut egui::Ui, text: &str) {
+    ui.allocate_ui_with_layout(
+        egui::vec2(92.0, 28.0),
+        egui::Layout::left_to_right(egui::Align::Center),
+        |ui| {
+            ui.label(egui::RichText::new(text).color(pal::TEXT));
+        },
+    );
+}
+
+// 顶部完成横幅
+fn banner(ui: &mut egui::Ui, color: egui::Color32, text: &str) {
+    egui::Frame {
+        inner_margin: egui::Margin::symmetric(12, 6),
+        outer_margin: egui::Margin::same(0),
+        fill: tint(color, 28),
+        stroke: egui::Stroke::new(1.0, tint(color, 80)),
+        corner_radius: egui::CornerRadius::same(8),
+        shadow: egui::Shadow::NONE,
+    }
+    .show(ui, |ui| {
+        ui.label(egui::RichText::new(text).color(color).strong());
+    });
 }
 
 // 状态徽章（圆角彩色小标签）。
@@ -1597,7 +2782,43 @@ fn open_btn(ui: &mut egui::Ui, label: &str) -> bool {
     ui.add(btn).clicked()
 }
 
-// 对比预览中的单个图片卡片（处理前 / 处理后）。
+// “处理后”单元在无结果时的占位文字（并排模式）。
+fn empty_after(ui: &mut egui::Ui, stage: Stage) {
+    match stage {
+        Stage::Failed => {
+            ui.label(egui::RichText::new("✗ 处理失败").color(pal::ERROR));
+        }
+        Stage::Skipped => {
+            ui.label(egui::RichText::new("已跳过").color(pal::WARN));
+        }
+        Stage::Done => {
+            ui.label(egui::RichText::new("无输出").color(pal::TEXT_WEAK));
+        }
+        _ => {
+            ui.spinner();
+            ui.label(egui::RichText::new("尚未生成…").color(pal::TEXT_WEAK).small());
+        }
+    }
+}
+
+// 滑动模式无结果时的占位（直接画在 painter 上）。
+fn empty_after_painter(painter: &egui::Painter, rect: egui::Rect, stage: Stage) {
+    let (txt, col) = match stage {
+        Stage::Failed => ("✗ 处理失败", pal::ERROR),
+        Stage::Skipped => ("已跳过", pal::WARN),
+        Stage::Done => ("无输出", pal::TEXT_WEAK),
+        _ => ("尚未生成…", pal::TEXT_WEAK),
+    };
+    painter.text(
+        egui::pos2(rect.center().x + rect.width() * 0.25, rect.center().y),
+        egui::Align2::CENTER_CENTER,
+        txt,
+        egui::FontId::proportional(14.0),
+        col,
+    );
+}
+
+// 对比预览中的单个图片卡片（处理前 / 处理后），用于并排模式。
 fn preview_cell(
     ui: &mut egui::Ui,
     title: &str,
@@ -1628,6 +2849,37 @@ fn preview_cell(
     });
 }
 
+// 纹理宽高比
+fn tex_aspect(t: &egui::TextureHandle) -> f32 {
+    let s = t.size_vec2();
+    if s.y > 0.0 {
+        s.x / s.y
+    } else {
+        1.0
+    }
+}
+
+// 在外框内按宽高比求“适应”矩形
+fn fit_rect(outer: egui::Rect, aspect: f32) -> egui::Rect {
+    let (ow, oh) = (outer.width(), outer.height());
+    let mut w = ow;
+    let mut h = ow / aspect;
+    if h > oh {
+        h = oh;
+        w = oh * aspect;
+    }
+    egui::Rect::from_center_size(outer.center(), egui::vec2(w, h))
+}
+
+// 把基础矩形按 zoom 缩放并平移到目标中心
+fn scaled_rect(base: egui::Rect, center: egui::Pos2, zoom: f32) -> egui::Rect {
+    egui::Rect::from_center_size(center, base.size() * zoom)
+}
+
+fn uv_full() -> egui::Rect {
+    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0))
+}
+
 // 日志按前缀着色。
 fn log_color(line: &str) -> egui::Color32 {
     let t = line.trim_start();
@@ -1644,21 +2896,40 @@ fn log_color(line: &str) -> egui::Color32 {
     }
 }
 
+// 日志是否匹配级别过滤。
+fn log_matches_filter(line: &str, f: LogFilter) -> bool {
+    if f == LogFilter::All {
+        return true;
+    }
+    let c = log_color(line);
+    match f {
+        LogFilter::All => true,
+        LogFilter::Success => c == pal::SUCCESS,
+        LogFilter::Error => c == pal::ERROR,
+        LogFilter::Warn => c == pal::WARN,
+        LogFilter::Info => c == pal::INFO || c == pal::TEXT_WEAK,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn decode_real_input_thumbnail() {
-        // 验证缩略图解码链路（真实大图 → 等比缩放 → RGBA）。
-        let p = std::path::Path::new(r"D:\ai_work\runninghub_api\input\1V3A2861.jpg");
-        if !p.exists() {
-            return; // 无样张时跳过
+    fn mk_item(name: &str, input: &str, stage: Stage, outputs: Vec<&str>, task_id: &str, detail: &str) -> Item {
+        Item {
+            name: name.into(),
+            input: PathBuf::from(input),
+            stage,
+            detail: detail.into(),
+            outputs: outputs.into_iter().map(PathBuf::from).collect(),
+            task_id: task_id.into(),
+            in_tex: None,
+            out_tex: None,
+            list_tex: None,
+            in_req: false,
+            out_req: false,
+            list_req: false,
         }
-        let (w, h, rgba) = decode_thumb(p).expect("应能解码 JPEG 缩略图");
-        assert!(w > 0 && h > 0, "尺寸应为正");
-        assert_eq!(rgba.len(), w * h * 4, "应为 RGBA 像素");
-        assert!(w as u32 <= THUMB_MAX && h as u32 <= THUMB_MAX, "应已缩放到上限内");
     }
 
     #[test]
@@ -1677,6 +2948,306 @@ mod tests {
         assert!(existing_outputs(d, "1V3A314").is_empty(), "前缀部分匹配不应误判");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn edit_value_typing() {
+        // 数字原值 → 解析为数字；非法 → 退化为字符串。
+        assert_eq!(edit_to_json_value("123456", &serde_json::json!(0)), serde_json::json!(123456i64));
+        assert_eq!(edit_to_json_value("1.5", &serde_json::json!(0.0)), serde_json::json!(1.5));
+        assert_eq!(
+            edit_to_json_value("8K高清", &serde_json::json!("")),
+            serde_json::json!("8K高清")
+        );
+    }
+
+    #[test]
+    fn store_migration_and_roundtrip() {
+        // 旧格式（裸 UiConfig）→ 自动包成 1 个预设
+        let old = r#"{"api_key":"k","workflow_id":"w","concurrency":3}"#;
+        let s = parse_store(old);
+        assert_eq!(s.presets.len(), 1);
+        assert_eq!(s.presets[0].cfg.api_key, "k");
+        assert_eq!(s.presets[0].cfg.workflow_id, "w");
+        assert_eq!(s.presets[0].cfg.concurrency, 3);
+
+        // 新格式 round-trip
+        let mut store = Store::default();
+        store.presets.push(Preset { name: "4K放大".into(), cfg: UiConfig::default() });
+        store.current = 1;
+        store.left_w = 300.0;
+        let txt = serde_json::to_string(&store).unwrap();
+        let back = parse_store(&txt);
+        assert_eq!(back.presets.len(), 2);
+        assert_eq!(back.presets[1].name, "4K放大");
+        assert_eq!(back.current, 1);
+        assert_eq!(back.left_w, 300.0);
+
+        // 垃圾 → 默认
+        let def = parse_store("not json");
+        assert_eq!(def.presets.len(), 1);
+    }
+
+    #[test]
+    fn store_normalize_clamps() {
+        let s = Store { presets: vec![], current: 9, win_w: 1.0, win_h: -3.0, left_w: 5.0, logs_h: 0.0 }.normalized();
+        assert_eq!(s.presets.len(), 1, "空预设应补一个默认");
+        assert_eq!(s.current, 0, "current 越界应夹紧");
+        assert!(s.win_w >= 640.0 && s.win_h >= 480.0 && s.left_w >= 160.0 && s.logs_h >= 60.0);
+    }
+
+    #[test]
+    fn manifest_from_items_statuses() {
+        let dir = std::env::temp_dir().join("vc_manifest_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let items = vec![
+            mk_item("a", r"C:\in\a.png", Stage::Done, vec![r"C:\out\a_rh.png"], "t1", ""),
+            mk_item("b", r"C:\in\b.png", Stage::Skipped, vec![r"C:\out\b_rh.png"], "", ""),
+            mk_item("c", r"C:\in\c.png", Stage::Failed, vec![], "", "任务超时"),
+            mk_item("d", r"C:\in\d.png", Stage::Done, vec![], "t2", ""),
+        ];
+        let p = write_manifest(dir.to_str().unwrap(), &items).unwrap();
+        let csv = std::fs::read_to_string(&p).unwrap();
+        assert!(csv.starts_with('\u{feff}'), "应有 UTF-8 BOM");
+        assert!(csv.contains("a_rh.png") && csv.contains(",ok,"), "成功行");
+        assert!(csv.contains(",skipped,"), "跳过行");
+        assert!(csv.contains("error: 任务超时"), "失败行带原因");
+        assert!(csv.contains(",no_output,"), "Done 但无输出 → no_output");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn list_filter_matches() {
+        assert!(ListFilter::All.matches(Stage::Failed));
+        assert!(ListFilter::Failed.matches(Stage::Failed));
+        assert!(!ListFilter::Failed.matches(Stage::Done));
+        assert!(ListFilter::Ok.matches(Stage::Done));
+        assert!(ListFilter::Skipped.matches(Stage::Skipped));
+        assert!(ListFilter::Active.matches(Stage::Uploading));
+        assert!(ListFilter::Active.matches(Stage::Queued));
+        assert!(!ListFilter::Active.matches(Stage::Done));
+    }
+
+    #[test]
+    fn log_filter_classification() {
+        assert!(log_matches_filter("✓ 完成：x", LogFilter::Success));
+        assert!(!log_matches_filter("✓ 完成：x", LogFilter::Error));
+        assert!(log_matches_filter("✗ 失败：x", LogFilter::Error));
+        assert!(log_matches_filter("⚠ 注意", LogFilter::Warn));
+        assert!(log_matches_filter("任何东西", LogFilter::All));
+    }
+
+    #[test]
+    fn coins_value_parse() {
+        let mut a = AccountInfo::default();
+        a.remain_coins = Some("12.5".into());
+        assert_eq!(coins_value(&a), Some(12.5));
+        a.remain_coins = Some("?".into());
+        assert_eq!(coins_value(&a), None);
+    }
+
+    #[test]
+    fn failed_indices_and_counts() {
+        let mut app = App::new_headless();
+        app.items = vec![
+            mk_item("a", "a", Stage::Done, vec![], "", ""),
+            mk_item("b", "b", Stage::Failed, vec![], "", "e"),
+            mk_item("c", "c", Stage::Skipped, vec![], "", ""),
+            mk_item("d", "d", Stage::Failed, vec![], "", "e"),
+        ];
+        assert_eq!(app.failed_indices(), vec![1, 3]);
+        let (done, ok, skip, fail) = app.counts();
+        assert_eq!((done, ok, skip, fail), (4, 1, 1, 2));
+    }
+
+    #[test]
+    fn start_run_validation_blocks_empty() {
+        // 空配置点开始 → 记录“还有参数没填”，不启动后台线程
+        let mut app = App::new_headless();
+        let ctx = egui::Context::default();
+        app.start_full(&ctx);
+        assert!(!app.running, "校验失败不应进入运行态");
+        assert!(
+            app.logs.iter().any(|l| l.contains("还有参数没填")),
+            "应提示缺参数，实得：{:?}",
+            app.logs
+        );
+    }
+
+    #[test]
+    fn handle_drop_folder_and_images() {
+        let base = std::env::temp_dir().join("vc_drop_test");
+        let _ = std::fs::create_dir_all(&base);
+        let img = base.join("p.png");
+        std::fs::write(&img, b"x").unwrap();
+        let txt = base.join("note.txt");
+        std::fs::write(&txt, b"x").unwrap();
+
+        let mut app = App::new_headless();
+        // 拖文件夹 → 设输入目录
+        app.handle_drop(vec![egui::DroppedFile { path: Some(base.clone()), ..Default::default() }]);
+        assert_eq!(app.cfg.input_dir, base.display().to_string());
+        // 拖图片 → 追加；拖 txt → 忽略
+        app.handle_drop(vec![
+            egui::DroppedFile { path: Some(img.clone()), ..Default::default() },
+            egui::DroppedFile { path: Some(txt.clone()), ..Default::default() },
+        ]);
+        assert_eq!(app.extra_files, vec![img.clone()], "只追加图片，忽略 txt");
+        // 重复拖同一张 → 不重复
+        app.handle_drop(vec![egui::DroppedFile { path: Some(img.clone()), ..Default::default() }]);
+        assert_eq!(app.extra_files.len(), 1, "去重");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn param_overrides_build_correct_json() {
+        let mut app = App::new_headless();
+        app.detected_params = vec![
+            workflow::DetectedParam {
+                node_id: "605".into(),
+                node_type: "KSampler".into(),
+                field: "seed".into(),
+                label: "种子".into(),
+                value: serde_json::json!(0),
+            },
+            workflow::DetectedParam {
+                node_id: "586".into(),
+                node_type: "CLIPTextEncode".into(),
+                field: "text".into(),
+                label: "提示词".into(),
+                value: serde_json::json!(""),
+            },
+        ];
+        // 只覆盖第一个（种子），第二个不勾
+        app.param_on = vec![true, false];
+        app.param_val = vec!["123456".into(), "改了但没勾".into()];
+        let ov = app.param_override_values();
+        assert_eq!(ov.len(), 1, "只产出勾选的项");
+        assert_eq!(ov[0]["nodeId"], "605");
+        assert_eq!(ov[0]["fieldName"], "seed");
+        assert_eq!(ov[0]["fieldValue"], serde_json::json!(123456i64), "数字按数字注入");
+    }
+}
+
+// ============ UI 层测试（egui_kittest 模拟点击/渲染真实控件树）============
+#[cfg(test)]
+mod ui_tests {
+    use super::*;
+    use egui_kittest::{kittest::Queryable, Harness};
+
+    fn harness<'a>() -> Harness<'a, App> {
+        let mut h = Harness::builder()
+            .with_size(egui::vec2(1280.0, 920.0))
+            .build_ui_state(|ui, app: &mut App| app.render(ui), App::new_headless());
+        h.run();
+        h
+    }
+
+    #[test]
+    fn renders_core_widgets() {
+        let h = harness();
+        // 主操作按钮 + 表单关键标签都应出现在控件树里
+        // 用精确按钮文案，避免与空列表占位语里同样含“开始批量处理”的文字冲突
+        assert!(
+            h.query_by_label("▶  开始批量处理").is_some(),
+            "应渲染“开始批量处理”按钮"
+        );
+        assert!(h.query_by_label("API Key").is_some(), "应渲染 API Key 标签");
+        assert!(h.query_by_label("工作流 ID").is_some(), "应渲染 工作流 ID 标签");
+    }
+
+    #[test]
+    fn click_start_with_empty_config_logs_validation() {
+        let mut h = harness();
+        h.get_by_label("▶  开始批量处理").click();
+        h.run();
+        assert!(
+            h.state().logs.iter().any(|l| l.contains("还有参数没填")),
+            "点开始后应有缺参数提示，实得：{:?}",
+            h.state().logs
+        );
+        assert!(!h.state().running);
+    }
+
+    #[test]
+    fn toggle_settings_hides_form() {
+        let mut h = harness();
+        assert!(h.query_by_label("API Key").is_some(), "默认展开设置");
+        h.get_by_label_contains("参数设置").click();
+        h.run();
+        assert!(!h.state().show_settings, "点击后应收起设置");
+        assert!(
+            h.query_by_label("API Key").is_none(),
+            "收起后表单标签应消失"
+        );
+    }
+
+    #[test]
+    fn new_and_delete_preset_via_buttons() {
+        let mut h = harness();
+        assert_eq!(h.state().store.presets.len(), 1);
+        h.get_by_label_contains("新建").click();
+        h.run();
+        assert_eq!(h.state().store.presets.len(), 2, "新建后应有 2 个预设");
+        assert_eq!(h.state().store.current, 1, "应切到新预设");
+        h.get_by_label_contains("删除").click();
+        h.run();
+        assert_eq!(h.state().store.presets.len(), 1, "删除后回到 1 个");
+        assert_eq!(h.state().store.current, 0);
+    }
+
+    fn item(name: &str, stage: Stage) -> Item {
+        Item {
+            name: name.into(),
+            input: PathBuf::from(format!("{name}.png")),
+            stage,
+            detail: String::new(),
+            outputs: Vec::new(),
+            task_id: String::new(),
+            in_tex: None,
+            out_tex: None,
+            list_tex: None,
+            in_req: false,
+            out_req: false,
+            list_req: false,
+        }
+    }
+
+    #[test]
+    fn list_filter_click_failed() {
+        let mut h = harness();
+        // 收起设置（与真实“看列表”场景一致），让左侧列表有完整高度
+        h.state_mut().show_settings = false;
+        h.state_mut().items = vec![item("a", Stage::Done), item("b", Stage::Failed)];
+        h.run();
+        // 列表筛选条里的“失败”按钮（精确文案，不与状态徽章“✗ 失败”冲突）
+        h.get_by_label("失败").click();
+        h.run();
+        assert!(matches!(h.state().list_filter, ListFilter::Failed));
+    }
+
+    #[test]
+    fn compare_mode_toggle_to_wipe() {
+        let mut h = harness();
+        h.state_mut().items = vec![item("a", Stage::Done)];
+        h.state_mut().selected = Some(0);
+        h.run();
+        assert!(matches!(h.state().cmp_mode, CmpMode::Side), "默认并排");
+        h.get_by_label("滑动对比").click();
+        h.run();
+        assert!(matches!(h.state().cmp_mode, CmpMode::Wipe), "点击后切到滑动对比");
+    }
+
+    #[test]
+    fn retry_failed_button_shows_count() {
+        let mut h = harness();
+        h.state_mut().items = vec![item("b", Stage::Failed), item("c", Stage::Failed)];
+        h.run();
+        assert!(
+            h.query_by_label_contains("重试失败项 (2)").is_some(),
+            "有 2 个失败项时应出现“重试失败项 (2)”按钮"
+        );
     }
 }
 

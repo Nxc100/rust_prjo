@@ -31,3 +31,6 @@ lto = true
 strip = true
 codegen-units = 1
 panic = "abort"
+
+[dev-dependencies]
+egui_kittest = { version = "0.34.3", default-features = false }

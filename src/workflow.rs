@@ -43,6 +43,65 @@ pub fn detect_io_nodes(json_path: &Path) -> Result<IoNodes> {
     Ok(io)
 }
 
+/// 工作流里检测到的一个可调参数（来自 ComfyUI 节点的 widgets_values）。
+/// 调用方据此渲染表单控件，用户改动后转回 nodeInfoList 覆盖项。
+#[derive(Clone)]
+pub struct DetectedParam {
+    pub node_id: String,
+    pub node_type: String,
+    pub field: String,            // nodeInfoList 用的 fieldName（如 seed/text/scale_by）
+    pub label: String,            // 给人看的中文标签
+    pub value: Value,            // 工作流里的当前值（作为编辑初值）
+}
+
+/// 解析工作流，提取常见可调参数。仅覆盖字段名稳定、语义明确的节点类型，
+/// 避免猜错字段名导致跑坏用户工作流。
+pub fn detect_params(json_path: &Path) -> Result<Vec<DetectedParam>> {
+    let text = std::fs::read_to_string(json_path)
+        .map_err(|e| anyhow!("无法读取工作流文件 {}：{e}", json_path.display()))?;
+    let wf: Value = serde_json::from_str(&text).map_err(|e| anyhow!("工作流 JSON 解析失败：{e}"))?;
+    let nodes = wf
+        .get("nodes")
+        .and_then(|n| n.as_array())
+        .ok_or_else(|| anyhow!("不是有效的工作流 JSON（缺少 nodes 字段）"))?;
+
+    // node_type -> [(widgets_values 下标, fieldName, 中文标签)]
+    // 下标依据 ComfyUI 各节点 widgets_values 的固定排列。
+    let map: &[(&str, &[(usize, &str, &str)])] = &[
+        ("KSampler", &[(0, "seed", "种子"), (2, "steps", "步数"), (3, "cfg", "CFG"), (6, "denoise", "重绘幅度")]),
+        ("KSamplerAdvanced", &[(1, "noise_seed", "种子"), (3, "steps", "步数"), (4, "cfg", "CFG")]),
+        ("CLIPTextEncode", &[(0, "text", "提示词")]),
+        ("ImageScaleBy", &[(1, "scale_by", "放大倍数")]),
+    ];
+
+    let mut out = Vec::new();
+    for n in nodes {
+        let ty = n.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        let Some((_, specs)) = map.iter().find(|(t, _)| *t == ty) else { continue };
+        let id = match n.get("id") {
+            Some(Value::Number(num)) => num.to_string(),
+            Some(Value::String(s)) => s.clone(),
+            _ => continue,
+        };
+        let Some(wv) = n.get("widgets_values").and_then(|w| w.as_array()) else { continue };
+        for (idx, field, label) in *specs {
+            let Some(v) = wv.get(*idx) else { continue };
+            // 跳过不可编辑的占位（如 null）。
+            if v.is_null() {
+                continue;
+            }
+            out.push(DetectedParam {
+                node_id: id.clone(),
+                node_type: ty.to_string(),
+                field: field.to_string(),
+                label: label.to_string(),
+                value: v.clone(),
+            });
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

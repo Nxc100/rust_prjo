@@ -270,6 +270,38 @@ impl RhClient {
         Ok(())
     }
 
+    /// 同 account_status，但把网络/接口错误透出（用于“测试连接”按钮，能区分
+    /// 成功 / Key 无效 / 网络不通）。
+    pub fn account_status_checked(&self) -> Result<AccountInfo> {
+        let url = format!("{BASE}/uc/openapi/accountStatus");
+        let body = serde_json::json!({ "apiKey": self.api_key });
+        let v: serde_json::Value = self.with_retry(|| {
+            Ok(self
+                .http
+                .post(url.as_str())
+                .json(&body)
+                .send()?
+                .error_for_status()?
+                .json()?)
+        })?;
+        let code = v.get("code").and_then(|x| x.as_i64()).unwrap_or(-1);
+        if code != 0 {
+            let msg = v.get("msg").and_then(|x| x.as_str()).unwrap_or("");
+            return Err(anyhow!("apiKey 无效或接口异常（code={code} {msg}）"));
+        }
+        let mut info = AccountInfo::default();
+        if let Some(data) = v.get("data") {
+            if let Some(c) = data.get("currentTaskCounts") {
+                info.current_task_counts = value_to_string(c);
+            }
+            let coins = data.get("remainCoins").or_else(|| data.get("remainMoney"));
+            if let Some(c) = coins {
+                info.remain_coins = value_to_string(c);
+            }
+        }
+        Ok(info)
+    }
+
     /// 查询账户状态：并发占用 currentTaskCounts、余额 remainCoins/remainMoney。
     pub fn account_status(&self) -> AccountInfo {
         let url = format!("{BASE}/uc/openapi/accountStatus");
