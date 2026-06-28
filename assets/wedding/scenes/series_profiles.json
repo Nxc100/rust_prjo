@@ -1,0 +1,37 @@
+{
+  "_note": "场景配置卡(四轴拆开)：每个 series 一条，把场景专属话从模板抠出来由此注入。模板与 match_scene 一律不动；加新概念=复制一条改值。字段对应《四轴拆开_参数化改造方案》§八的 14 处。occlusion_fg 可留空字符串→不输出前景遮挡句(纯净背景概念)。",
+  "bbsh": {
+    "scene_label": "步步生花外景",
+    "scene_structure": "花径/花瓣的走向与疏密分布、草地、树木与远景",
+    "ground_feat": "花径/花丛",
+    "ground_feat2": "花径或花丛",
+    "color_anchor": "草地绿与三叶草、深绿树丛",
+    "scene_area": "草地花径",
+    "scene_elements": "草坪与花瓣",
+    "overcast_color": "草地的清新绿意",
+    "overcast_color2": "绿意与天光",
+    "dof_scene_full": "花径与远景",
+    "dof_scene_medium": "花丛草地",
+    "placement_full": "让人物完整站在图B的花瓣花径上、（若有长拖尾）让拖尾自然铺展并压在粉白花瓣花径上、花瓣零星散落在裙摆与拖尾上、身后路径向纵深延伸",
+    "placement_medium": "让人物处在图B的花丛/花径环境中、画面下半部由草与花瓣柔和填充",
+    "occlusion_fg": "花瓣／草叶",
+    "default_key": "natural"
+  },
+  "jiaoshi": {
+    "scene_label": "礁石海景外景",
+    "scene_structure": "礁石/岩台的走向与起伏、海面与海平线、海浪与天空",
+    "ground_feat": "礁石/岩台",
+    "ground_feat2": "礁石或岩台",
+    "color_anchor": "青蓝色海水与海面、灰褐色礁石、蓝色天空",
+    "scene_area": "礁石海岸",
+    "scene_elements": "礁石与海面",
+    "overcast_color": "海天的清新蓝意",
+    "overcast_color2": "蓝意与天光",
+    "dof_scene_full": "海面与远景海平线",
+    "dof_scene_medium": "礁石与海面",
+    "placement_full": "让人物完整站在图B的礁石／岩台上、（若有长拖尾）让拖尾自然垂落并铺展在岩石表面、身后是开阔的海面与天空向纵深延展、海平线在身后清晰延伸",
+    "placement_medium": "让人物处在图B的礁石海岸环境中、画面下半部由礁石岩面与近处海水柔和填充",
+    "occlusion_fg": "",
+    "default_key": "warm"
+  }
+}

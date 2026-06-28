@@ -3,6 +3,9 @@ output
 target
 toolchain
 
+# 4sapi 密钥，绝不入库
+key.txt
+
 # Inno Setup 打包脚本与生成的安装包
 installer.iss
 installer/

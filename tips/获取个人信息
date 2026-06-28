@@ -1,0 +1,234 @@
+# 1. 获取个人信息
+
+## OpenAPI Specification
+
+```yaml
+openapi: 3.0.1
+info:
+  title: ''
+  description: ''
+  version: 1.0.0
+paths:
+  /api/user/self:
+    get:
+      summary: 1. 获取个人信息
+      deprecated: false
+      description: ''
+      tags:
+        - 个人API接口文档/一、个人信息
+      parameters:
+        - name: Authorization
+          in: header
+          description: ''
+          required: false
+          example: token
+          schema:
+            type: string
+        - name: New-Api-User
+          in: header
+          description: ''
+          required: false
+          example: '126638'
+          schema:
+            type: string
+      responses:
+        '200':
+          description: ''
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      aff_code:
+                        type: string
+                      aff_count:
+                        type: integer
+                      aff_history_quota:
+                        type: integer
+                      aff_quota:
+                        type: integer
+                      discord_id:
+                        type: string
+                      display_name:
+                        type: string
+                      email:
+                        type: string
+                      github_id:
+                        type: string
+                      group:
+                        type: string
+                      id:
+                        type: integer
+                      inviter_id:
+                        type: integer
+                      linux_do_id:
+                        type: string
+                      oidc_id:
+                        type: string
+                      permissions:
+                        type: object
+                        properties:
+                          sidebar_modules:
+                            type: object
+                            properties:
+                              admin:
+                                type: boolean
+                            required:
+                              - admin
+                            x-apifox-orders:
+                              - admin
+                          sidebar_settings:
+                            type: boolean
+                        required:
+                          - sidebar_modules
+                          - sidebar_settings
+                        x-apifox-orders:
+                          - sidebar_modules
+                          - sidebar_settings
+                      quota:
+                        type: integer
+                      request_count:
+                        type: integer
+                      role:
+                        type: integer
+                      setting:
+                        type: string
+                      sidebar_modules:
+                        type: string
+                      status:
+                        type: integer
+                      stripe_customer:
+                        type: string
+                      telegram_id:
+                        type: string
+                      used_quota:
+                        type: integer
+                      username:
+                        type: string
+                      wechat_id:
+                        type: string
+                    required:
+                      - aff_code
+                      - aff_count
+                      - aff_history_quota
+                      - aff_quota
+                      - discord_id
+                      - display_name
+                      - email
+                      - github_id
+                      - group
+                      - id
+                      - inviter_id
+                      - linux_do_id
+                      - oidc_id
+                      - permissions
+                      - quota
+                      - request_count
+                      - role
+                      - setting
+                      - sidebar_modules
+                      - status
+                      - stripe_customer
+                      - telegram_id
+                      - used_quota
+                      - username
+                      - wechat_id
+                    x-apifox-orders:
+                      - aff_code
+                      - aff_count
+                      - aff_history_quota
+                      - aff_quota
+                      - discord_id
+                      - display_name
+                      - email
+                      - github_id
+                      - group
+                      - id
+                      - inviter_id
+                      - linux_do_id
+                      - oidc_id
+                      - permissions
+                      - quota
+                      - request_count
+                      - role
+                      - setting
+                      - sidebar_modules
+                      - status
+                      - stripe_customer
+                      - telegram_id
+                      - used_quota
+                      - username
+                      - wechat_id
+                    description: 返回数据
+                  message:
+                    type: string
+                    description: 返回信息
+                  success:
+                    type: boolean
+                    description: 调用是否成功
+                  01KM4KSNZ94JHF27TPPEK7G6MJ:
+                    type: string
+                required:
+                  - data
+                  - message
+                  - success
+                x-apifox-orders:
+                  - data
+                  - message
+                  - success
+                  - 01KM4KSNZ94JHF27TPPEK7G6MJ
+              example:
+                data:
+                  aff_code: Tmps
+                  aff_count: 0
+                  aff_history_quota: 0
+                  aff_quota: 0
+                  discord_id: ''
+                  display_name: user
+                  email: user@163.com
+                  github_id: ''
+                  group: 星链
+                  id: 126638
+                  inviter_id: 0
+                  linux_do_id: ''
+                  oidc_id: ''
+                  permissions:
+                    sidebar_modules:
+                      admin: false
+                    sidebar_settings: true
+                  quota: 18016813
+                  request_count: 419
+                  role: 1
+                  setting: >-
+                    {"gotify_priority":0,"sidebar_modules":"{\"chat\":{\"chat\":true,\"enabled\":true,\"playground\":true},\"console\":{\"detail\":true,\"enabled\":true,\"log\":true,\"midjourney\":true,\"task\":true,\"token\":true},\"personal\":{\"enabled\":true,\"personal\":true,\"topup\":true}}"}
+                  sidebar_modules: >-
+                    {"chat":{"chat":true,"enabled":true,"playground":true},"console":{"detail":true,"enabled":true,"log":true,"midjourney":true,"task":true,"token":true},"personal":{"enabled":true,"personal":true,"topup":true}}
+                  status: 1
+                  stripe_customer: ''
+                  telegram_id: ''
+                  used_quota: 31983187
+                  username: user
+                  wechat_id: ''
+                message: ''
+                success: true
+          headers: {}
+          x-apifox-name: 成功
+      security: []
+      x-apifox-folder: 个人API接口文档/一、个人信息
+      x-apifox-status: released
+      x-run-in-apifox: https://app.apifox.com/web/project/7224055/apis/api-430912883-run
+components:
+  schemas: {}
+  securitySchemes:
+    bearer:
+      type: bearer
+      scheme: bearer
+servers:
+  - url: https://4sapi.com
+    description: cs
+security: []
+
+```

@@ -1,0 +1,130 @@
+# 6. 更新用户设置（额度预警等）
+
+## OpenAPI Specification
+
+```yaml
+openapi: 3.0.1
+info:
+  title: ''
+  description: ''
+  version: 1.0.0
+paths:
+  /api/user/setting:
+    put:
+      summary: 6. 更新用户设置（额度预警等）
+      deprecated: false
+      description: ''
+      tags:
+        - 个人API接口文档/一、个人信息
+      parameters:
+        - name: Authorization
+          in: header
+          description: ''
+          required: false
+          example: user-token
+          schema:
+            type: string
+        - name: New-Api-User
+          in: header
+          description: ''
+          required: false
+          example: user-id
+          schema:
+            type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                notify_type:
+                  type: string
+                  description: 预警类型：email / webhook / bark / gotify
+                quota_warning_threshold:
+                  type: integer
+                  description: 当钱包或订阅剩余额度低于此数值时，系统将通过选择的方式发送通知
+                notification_email:
+                  type: string
+                  description: 通知邮箱（email 类型时）email
+                webhook_url:
+                  type: string
+                  description: Webhook 地址
+                webhook_secret:
+                  type: string
+                  description: Webhook 密钥
+                bark_url:
+                  type: string
+                  description: Bark 推送地址
+                gotify_url:
+                  type: string
+                  description: Gotify 服务器地址
+                gotify_token:
+                  type: string
+                  description: Gotify 令牌
+                gotify_priority:
+                  type: integer
+                  description: Gotify 优先级
+                accept_unset_model_ratio_model:
+                  type: boolean
+                  description: 是否接受未设置倍率的模型
+                record_ip_log:
+                  type: boolean
+                  description: 是否记录 IP 日志
+                01KM4XVH0M6DMGG4AWBKE4KXSF:
+                  type: string
+              required:
+                - notify_type
+                - quota_warning_threshold
+              x-apifox-orders:
+                - notify_type
+                - quota_warning_threshold
+                - notification_email
+                - webhook_url
+                - webhook_secret
+                - bark_url
+                - gotify_url
+                - gotify_token
+                - gotify_priority
+                - accept_unset_model_ratio_model
+                - record_ip_log
+                - 01KM4XVH0M6DMGG4AWBKE4KXSF
+            example:
+              notify_type: email
+              quota_warning_threshold: 32
+              notification_email: emali@163.com
+      responses:
+        '200':
+          description: ''
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: 'null'
+                  message:
+                    type: string
+                  success:
+                    type: boolean
+                required:
+                  - data
+                  - message
+                  - success
+          headers: {}
+          x-apifox-name: 成功
+      security: []
+      x-apifox-folder: 个人API接口文档/一、个人信息
+      x-apifox-status: released
+      x-run-in-apifox: https://app.apifox.com/web/project/7224055/apis/api-431022981-run
+components:
+  schemas: {}
+  securitySchemes:
+    bearer:
+      type: bearer
+      scheme: bearer
+servers:
+  - url: https://4sapi.com
+    description: cs
+security: []
+
+```

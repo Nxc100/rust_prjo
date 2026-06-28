@@ -1,0 +1,665 @@
+{
+  "_note": "步步生花场景库(series=bbsh，当前 11 条；2026-06-17 用户筛定)。一本相册按 series 抽场景；景别×场景：full→花径path；medium/close→散花scatter；close/closeup→花毯field。字段见各条。comp_prompt 已删光照/天气句只留构图，双图模式下实际以 scenes\\<id>.jpg 这张真实plate为准。 | 2026-06-22 新增 series=jiaoshi 礁石海景7张(jiaoshi_01~07，用户筛定·二次筛选#2/4/5/6/8/9/11)。",
+  "scenes": [
+    {
+      "id": "bbsh_open01",
+      "file": "bbsh_open01.jpg",
+      "series": "bbsh",
+      "source": "微信：PSYOUYA  优雅高端修图培训 (6).jpg",
+      "light": "neutral",
+      "composition": "long_path_Scurve",
+      "has_foreground_path": true,
+      "fits_shot": [
+        "full"
+      ],
+      "comp_prompt": "开阔、修剪整齐的绿色草坪上，一条由淡粉、浅樱、奶白色玫瑰花瓣与细碎小花铺成的蜿蜒花径，自画面前景向纵深呈柔和 S 形延展、由密渐疏、最终散为零星花瓣融入草地，两侧为平整开阔草地。",
+      "notes": "开阔草坪·粉白S形花径·全身首选",
+      "figure_anchor": {
+        "foot": [
+          0.45,
+          0.87
+        ],
+        "zone": [
+          0.3,
+          0.55,
+          0.6,
+          0.95
+        ],
+        "ground_y": 0.87,
+        "max_shot": "full"
+      },
+      "has_fg_elements": true,
+      "view_angle": "high",
+      "lead_dir": "center",
+      "supports_train": true,
+      "ground_amount": "full",
+      "backdrop": "open",
+      "mood": "fresh",
+      "depth": "mid"
+    },
+    {
+      "id": "bbsh_open02",
+      "file": "bbsh_open02.jpg",
+      "series": "bbsh",
+      "source": "微信：PSYOUYA  优雅高端修图培训 (30).jpg",
+      "light": "neutral",
+      "composition": "long_path_Scurve",
+      "has_foreground_path": true,
+      "fits_shot": [
+        "full"
+      ],
+      "comp_prompt": "开阔、修剪整齐的绿色草坪上，一条由淡粉、浅樱、奶白色玫瑰花瓣与细碎小花铺成的蜿蜒花径，自画面前景向纵深呈柔和 S 形延展、由密渐疏、最终散为零星花瓣融入草地，两侧为平整开阔草地。",
+      "notes": "开阔草坪·粉白S形花径·全身首选",
+      "figure_anchor": {
+        "foot": [
+          0.45,
+          0.87
+        ],
+        "zone": [
+          0.3,
+          0.55,
+          0.6,
+          0.95
+        ],
+        "ground_y": 0.87,
+        "max_shot": "full"
+      },
+      "has_fg_elements": true,
+      "view_angle": "high",
+      "lead_dir": "center",
+      "supports_train": true,
+      "ground_amount": "full",
+      "backdrop": "open",
+      "mood": "fresh",
+      "depth": "mid"
+    },
+    {
+      "id": "bbsh_open03",
+      "file": "bbsh_open03.jpg",
+      "series": "bbsh",
+      "source": "微信：PSYOUYA  优雅高端修图培训 (62).jpg",
+      "light": "neutral",
+      "composition": "long_path_Scurve",
+      "has_foreground_path": true,
+      "fits_shot": [
+        "full"
+      ],
+      "comp_prompt": "开阔、修剪整齐的绿色草坪上，一条由淡粉、浅樱、奶白色玫瑰花瓣与细碎小花铺成的蜿蜒花径，自画面前景向纵深呈柔和 S 形延展、由密渐疏、最终散为零星花瓣融入草地，两侧为平整开阔草地。",
+      "notes": "开阔草坪·粉白S形花径·全身首选",
+      "figure_anchor": {
+        "foot": [
+          0.45,
+          0.87
+        ],
+        "zone": [
+          0.3,
+          0.55,
+          0.6,
+          0.95
+        ],
+        "ground_y": 0.87,
+        "max_shot": "full"
+      },
+      "has_fg_elements": true,
+      "view_angle": "high",
+      "lead_dir": "center",
+      "supports_train": true,
+      "ground_amount": "full",
+      "backdrop": "open",
+      "mood": "fresh",
+      "depth": "mid"
+    },
+    {
+      "id": "bbsh_open04",
+      "file": "bbsh_open04.jpg",
+      "series": "bbsh",
+      "source": "微信：PSYOUYA  优雅高端修图培训 (34).jpg",
+      "light": "neutral",
+      "composition": "long_path_Scurve",
+      "has_foreground_path": true,
+      "fits_shot": [
+        "full"
+      ],
+      "comp_prompt": "开阔、修剪整齐的绿色草坪上，一条由淡粉、浅樱、奶白色玫瑰花瓣与细碎小花铺成的蜿蜒花径，自画面前景向纵深呈柔和 S 形延展、由密渐疏、最终散为零星花瓣融入草地，两侧为平整开阔草地。",
+      "notes": "开阔草坪·粉白S形花径·全身首选",
+      "figure_anchor": {
+        "foot": [
+          0.45,
+          0.87
+        ],
+        "zone": [
+          0.3,
+          0.55,
+          0.6,
+          0.95
+        ],
+        "ground_y": 0.87,
+        "max_shot": "full"
+      },
+      "has_fg_elements": true,
+      "view_angle": "high",
+      "lead_dir": "center",
+      "supports_train": true,
+      "ground_amount": "full",
+      "backdrop": "open",
+      "mood": "fresh",
+      "depth": "mid"
+    },
+    {
+      "id": "bbsh_open05",
+      "file": "bbsh_open05.jpg",
+      "series": "bbsh",
+      "source": "微信：PSYOUYA  优雅高端修图培训 (48).jpg",
+      "light": "neutral",
+      "composition": "long_path_Scurve",
+      "has_foreground_path": true,
+      "fits_shot": [
+        "full"
+      ],
+      "comp_prompt": "开阔、修剪整齐的绿色草坪上，一条由淡粉、浅樱、奶白色玫瑰花瓣与细碎小花铺成的蜿蜒花径，自画面前景向纵深呈柔和 S 形延展、由密渐疏、最终散为零星花瓣融入草地，两侧为平整开阔草地。",
+      "notes": "开阔草坪·粉白S形花径·全身首选",
+      "figure_anchor": {
+        "foot": [
+          0.45,
+          0.87
+        ],
+        "zone": [
+          0.3,
+          0.55,
+          0.6,
+          0.95
+        ],
+        "ground_y": 0.87,
+        "max_shot": "full"
+      },
+      "has_fg_elements": true,
+      "view_angle": "high",
+      "lead_dir": "center",
+      "supports_train": true,
+      "ground_amount": "full",
+      "backdrop": "open",
+      "mood": "fresh",
+      "depth": "mid"
+    },
+    {
+      "id": "bbsh_forest01",
+      "file": "bbsh_forest01.jpg",
+      "series": "bbsh",
+      "source": "微信：PSYOUYA  优雅高端修图培训 (101).jpg",
+      "light": "neutral",
+      "composition": "long_path_Scurve",
+      "has_foreground_path": true,
+      "fits_shot": [
+        "full"
+      ],
+      "comp_prompt": "修剪整齐的草坪上，一条淡粉、浅樱、奶白色花瓣花径自前景蜿蜒向纵深延展、逐渐变窄变淡；中景到背景是浓密的绿色树林与树木掩映。",
+      "notes": "花径通向绿树林·全身",
+      "figure_anchor": {
+        "foot": [
+          0.45,
+          0.87
+        ],
+        "zone": [
+          0.3,
+          0.55,
+          0.6,
+          0.95
+        ],
+        "ground_y": 0.87,
+        "max_shot": "full"
+      },
+      "has_fg_elements": true,
+      "view_angle": "high",
+      "lead_dir": "center",
+      "supports_train": true,
+      "ground_amount": "full",
+      "backdrop": "open",
+      "mood": "fresh",
+      "depth": "mid"
+    },
+    {
+      "id": "bbsh_red01",
+      "file": "bbsh_red01.jpg",
+      "series": "bbsh",
+      "source": "微信：PSYOUYA  优雅高端修图培训 (74).jpg",
+      "light": "neutral",
+      "composition": "long_path_Scurve",
+      "has_foreground_path": true,
+      "fits_shot": [
+        "full"
+      ],
+      "comp_prompt": "开阔绿色草坪上，一条由红色与暗红色玫瑰花瓣铺成的蜿蜒花径自前景向纵深 S 形延展、由密渐疏，两侧为平整草地，色彩浓郁。",
+      "notes": "红玫瑰花瓣花径·全身(红色主题)",
+      "figure_anchor": {
+        "foot": [
+          0.45,
+          0.87
+        ],
+        "zone": [
+          0.3,
+          0.55,
+          0.6,
+          0.95
+        ],
+        "ground_y": 0.87,
+        "max_shot": "full"
+      },
+      "has_fg_elements": true,
+      "view_angle": "high",
+      "lead_dir": "center",
+      "supports_train": true,
+      "ground_amount": "full",
+      "backdrop": "open",
+      "mood": "fresh",
+      "depth": "mid"
+    },
+    {
+      "id": "bbsh_scatter05",
+      "file": "bbsh_scatter05.jpg",
+      "series": "bbsh",
+      "source": "微信：PSYOUYA  优雅高端修图培训 (28).jpg",
+      "light": "overcast_cool",
+      "composition": "scattered_petals",
+      "has_foreground_path": false,
+      "fits_shot": [
+        "medium",
+        "close"
+      ],
+      "comp_prompt": "平整草坪上自然散落着大片淡粉、浅樱、奶白色玫瑰花瓣与点点小花，没有明显的单一路径，近处花瓣较密、向远处渐稀、贴合草地起伏、扁平贴地，背景是低矮的绿树带与草坡。",
+      "notes": "散花无路径·中景/近景下半框填充",
+      "figure_anchor": {
+        "foot": [
+          0.5,
+          0.95
+        ],
+        "zone": [
+          0.28,
+          0.45,
+          0.72,
+          0.98
+        ],
+        "ground_y": 0.92,
+        "max_shot": "medium"
+      },
+      "has_fg_elements": true,
+      "view_angle": "high",
+      "lead_dir": "none",
+      "supports_train": false,
+      "ground_amount": "full",
+      "backdrop": "none",
+      "mood": "fresh",
+      "depth": "mid"
+    },
+    {
+      "id": "bbsh_field01",
+      "file": "bbsh_field01.jpg",
+      "series": "bbsh",
+      "source": "微信：PSYOUYA  优雅高端修图培训 (94).jpg",
+      "light": "neutral",
+      "composition": "dense_field",
+      "has_foreground_path": false,
+      "fits_shot": [
+        "close",
+        "closeup",
+        "medium"
+      ],
+      "comp_prompt": "开阔草坪上铺撒着大量淡粉与奶白色花瓣与细碎小花，由近及远疏密变化、覆盖大片地面形成柔软花毯质感，背景是一道浓密的绿色树林带与开阔草坡。",
+      "notes": "花瓣花毯·近景/特写虚化铺底",
+      "figure_anchor": {
+        "foot": [
+          0.5,
+          0.97
+        ],
+        "zone": [
+          0.2,
+          0.55,
+          0.8,
+          0.99
+        ],
+        "ground_y": 0.95,
+        "max_shot": "medium"
+      },
+      "has_fg_elements": true,
+      "view_angle": "high",
+      "lead_dir": "none",
+      "supports_train": false,
+      "ground_amount": "full",
+      "backdrop": "open",
+      "mood": "fresh",
+      "depth": "shallow"
+    },
+    {
+      "id": "bbsh_field02",
+      "file": "bbsh_field02.jpg",
+      "series": "bbsh",
+      "source": "微信：PSYOUYA  优雅高端修图培训 (93).jpg",
+      "light": "neutral",
+      "composition": "dense_field",
+      "has_foreground_path": false,
+      "fits_shot": [
+        "close",
+        "closeup",
+        "medium"
+      ],
+      "comp_prompt": "开阔草坪上铺撒着大量淡粉与奶白色花瓣与细碎小花，由近及远疏密变化、覆盖大片地面形成柔软花毯质感，背景是一道浓密的绿色树林带与开阔草坡。",
+      "notes": "花瓣花毯·近景/特写虚化铺底",
+      "figure_anchor": {
+        "foot": [
+          0.5,
+          0.97
+        ],
+        "zone": [
+          0.2,
+          0.55,
+          0.8,
+          0.99
+        ],
+        "ground_y": 0.95,
+        "max_shot": "medium"
+      },
+      "has_fg_elements": true,
+      "view_angle": "high",
+      "lead_dir": "none",
+      "supports_train": false,
+      "ground_amount": "full",
+      "backdrop": "open",
+      "mood": "fresh",
+      "depth": "shallow"
+    },
+    {
+      "id": "bbsh_field03",
+      "file": "bbsh_field03.jpg",
+      "series": "bbsh",
+      "source": "微信：PSYOUYA  优雅高端修图培训 (96).jpg",
+      "light": "neutral",
+      "composition": "dense_field",
+      "has_foreground_path": false,
+      "fits_shot": [
+        "close",
+        "closeup",
+        "medium"
+      ],
+      "comp_prompt": "开阔草坪上铺撒着大量淡粉与奶白色花瓣与细碎小花，由近及远疏密变化、覆盖大片地面形成柔软花毯质感，背景是一道浓密的绿色树林带与开阔草坡。",
+      "notes": "花瓣花毯·近景/特写虚化铺底",
+      "figure_anchor": {
+        "foot": [
+          0.5,
+          0.97
+        ],
+        "zone": [
+          0.2,
+          0.55,
+          0.8,
+          0.99
+        ],
+        "ground_y": 0.95,
+        "max_shot": "medium"
+      },
+      "has_fg_elements": true,
+      "view_angle": "high",
+      "lead_dir": "none",
+      "supports_train": false,
+      "ground_amount": "full",
+      "backdrop": "open",
+      "mood": "fresh",
+      "depth": "shallow"
+    },
+    {
+      "id": "jiaoshi_01",
+      "file": "jiaoshi_01.jpg",
+      "series": "jiaoshi",
+      "source": "work2/礁石/2b14df6c...jpg",
+      "light": "neutral",
+      "composition": "rock_platform",
+      "has_foreground_path": false,
+      "fits_shot": [
+        "full",
+        "medium"
+      ],
+      "comp_prompt": "海边礁石海岸：前景是一片宽阔平整的灰褐色礁石/岩台，自画面下方向纵深延展、表面可供人物稳稳站立，中后景为开阔平静的海面与清晰海平线、上方为天空，构图开阔大气。",
+      "notes": "宽岩台·海平线·全身首选",
+      "figure_anchor": {
+        "foot": [
+          0.5,
+          0.85
+        ],
+        "zone": [
+          0.32,
+          0.5,
+          0.68,
+          0.95
+        ],
+        "ground_y": 0.82,
+        "max_shot": "full"
+      },
+      "has_fg_elements": false,
+      "view_angle": "high",
+      "lead_dir": "center",
+      "supports_train": true,
+      "ground_amount": "lots",
+      "backdrop": "open",
+      "mood": "fresh",
+      "depth": "mid"
+    },
+    {
+      "id": "jiaoshi_02",
+      "file": "jiaoshi_02.jpg",
+      "series": "jiaoshi",
+      "source": "work2/礁石/4bb52df8...jpg",
+      "light": "neutral",
+      "composition": "open_sea_minimal",
+      "has_foreground_path": false,
+      "fits_shot": [
+        "full"
+      ],
+      "comp_prompt": "海边礁石海岸：画面下缘是一道低平的礁石岩台，其上为大面积开阔的海面与清晰海平线、天空占据上部，留白充足、极简大气，人物立于前景岩台、身后是辽阔大海。",
+      "notes": "低岩台·极简大海·留白大",
+      "figure_anchor": {
+        "foot": [
+          0.5,
+          0.9
+        ],
+        "zone": [
+          0.32,
+          0.6,
+          0.68,
+          0.96
+        ],
+        "ground_y": 0.88,
+        "max_shot": "full"
+      },
+      "has_fg_elements": false,
+      "view_angle": "eye",
+      "lead_dir": "none",
+      "supports_train": true,
+      "ground_amount": "some",
+      "backdrop": "open",
+      "mood": "fresh",
+      "depth": "deep"
+    },
+    {
+      "id": "jiaoshi_03",
+      "file": "jiaoshi_03.jpg",
+      "series": "jiaoshi",
+      "source": "work2/礁石/4d09e261...jpg",
+      "light": "neutral",
+      "composition": "leading_line_rock",
+      "has_foreground_path": false,
+      "fits_shot": [
+        "full",
+        "medium"
+      ],
+      "comp_prompt": "海边礁石海岸：一片礁石岩台自画面前景斜向延入海中，旁侧有拍岸的白色浪花，中后景为开阔海面与海平线，岩台形成自然斜向引导线、画面带海浪动感。",
+      "notes": "斜向岩台引导线+浪花·动感",
+      "figure_anchor": {
+        "foot": [
+          0.45,
+          0.86
+        ],
+        "zone": [
+          0.26,
+          0.55,
+          0.62,
+          0.96
+        ],
+        "ground_y": 0.83,
+        "max_shot": "full"
+      },
+      "has_fg_elements": false,
+      "view_angle": "eye",
+      "lead_dir": "right",
+      "supports_train": true,
+      "ground_amount": "some",
+      "backdrop": "open",
+      "mood": "fresh",
+      "depth": "mid"
+    },
+    {
+      "id": "jiaoshi_04",
+      "file": "jiaoshi_04.jpg",
+      "series": "jiaoshi",
+      "source": "work2/礁石/7d26cc19...jpg",
+      "light": "neutral",
+      "composition": "leading_line_rock",
+      "has_foreground_path": false,
+      "fits_shot": [
+        "full",
+        "medium"
+      ],
+      "comp_prompt": "海边礁石海岸：一道狭长的礁石岩台自画面前景笔直向纵深延入海面、形成强烈的中心引导线，两侧为海水与拍岸浪花，尽头是开阔海面与海平线。",
+      "notes": "中心狭长岩台引导线·戏剧(配暖调佳)",
+      "figure_anchor": {
+        "foot": [
+          0.5,
+          0.88
+        ],
+        "zone": [
+          0.35,
+          0.55,
+          0.65,
+          0.96
+        ],
+        "ground_y": 0.85,
+        "max_shot": "full"
+      },
+      "has_fg_elements": false,
+      "view_angle": "eye",
+      "lead_dir": "center",
+      "supports_train": true,
+      "ground_amount": "some",
+      "backdrop": "open",
+      "mood": "fresh",
+      "depth": "deep"
+    },
+    {
+      "id": "jiaoshi_05",
+      "file": "jiaoshi_05.jpg",
+      "series": "jiaoshi",
+      "source": "work2/礁石/80fe474e...jpg",
+      "light": "neutral",
+      "composition": "open_sea_rock",
+      "has_foreground_path": false,
+      "fits_shot": [
+        "full"
+      ],
+      "comp_prompt": "海边礁石海岸：前景一侧为低矮礁石岩块，其余为极开阔的海面、海平线与带云的天空，留白大、空间通透，人物可立于礁石上、身后是辽阔海天。",
+      "notes": "礁石+极开阔海天云·留白",
+      "figure_anchor": {
+        "foot": [
+          0.4,
+          0.85
+        ],
+        "zone": [
+          0.2,
+          0.55,
+          0.6,
+          0.95
+        ],
+        "ground_y": 0.83,
+        "max_shot": "full"
+      },
+      "has_fg_elements": false,
+      "view_angle": "eye",
+      "lead_dir": "none",
+      "supports_train": true,
+      "ground_amount": "some",
+      "backdrop": "open",
+      "mood": "fresh",
+      "depth": "deep"
+    },
+    {
+      "id": "jiaoshi_06",
+      "file": "jiaoshi_06.jpg",
+      "series": "jiaoshi",
+      "source": "work2/礁石/b182ffef...jpg",
+      "light": "neutral",
+      "composition": "rock_platform",
+      "has_foreground_path": false,
+      "fits_shot": [
+        "full",
+        "medium"
+      ],
+      "comp_prompt": "海边礁石海岸：前景是一片厚实平整的深色礁石/岩台、占据画面下部可供人物稳稳站立，中后景为平静开阔的海面与海平线、上方天空。",
+      "notes": "厚实深色岩台·站人稳",
+      "figure_anchor": {
+        "foot": [
+          0.5,
+          0.82
+        ],
+        "zone": [
+          0.3,
+          0.5,
+          0.7,
+          0.92
+        ],
+        "ground_y": 0.78,
+        "max_shot": "full"
+      },
+      "has_fg_elements": false,
+      "view_angle": "high",
+      "lead_dir": "none",
+      "supports_train": true,
+      "ground_amount": "lots",
+      "backdrop": "open",
+      "mood": "fresh",
+      "depth": "mid"
+    },
+    {
+      "id": "jiaoshi_07",
+      "file": "jiaoshi_07.jpg",
+      "series": "jiaoshi",
+      "source": "work2/礁石/d7c7be9e...jpg",
+      "light": "neutral",
+      "composition": "rock_platform",
+      "has_foreground_path": false,
+      "fits_shot": [
+        "full"
+      ],
+      "comp_prompt": "海边礁石海岸：前景为深色圆浑的礁石岩块，其后为开阔的海面与清晰海平线、上方天空，构图干净、海面宽广。",
+      "notes": "圆浑礁石+宽海·干净",
+      "figure_anchor": {
+        "foot": [
+          0.5,
+          0.86
+        ],
+        "zone": [
+          0.32,
+          0.55,
+          0.68,
+          0.95
+        ],
+        "ground_y": 0.83,
+        "max_shot": "full"
+      },
+      "has_fg_elements": false,
+      "view_angle": "eye",
+      "lead_dir": "none",
+      "supports_train": true,
+      "ground_amount": "some",
+      "backdrop": "open",
+      "mood": "fresh",
+      "depth": "deep"
+    }
+  ],
+  "_schema_version": "v2.1-P1"
+}

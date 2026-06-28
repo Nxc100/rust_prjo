@@ -3808,6 +3808,7 @@ name = "visual_coast_batch"
 version = "1.0.0"
 dependencies = [
  "anyhow",
+ "base64",
  "crossbeam-channel",
  "eframe",
  "egui",

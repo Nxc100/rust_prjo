@@ -21,6 +21,7 @@ anyhow  = "1"
 crossbeam-channel = "0.5"  # 后台→UI 的消息通道、worker 任务队列
 # 解码图片做缩略图（处理前/后对比预览）。纯 Rust 编解码，无需 C 编译器。
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "webp"] }
+base64 = "0.22"            # 解码 4sapi 出图返回的 b64_json（纯 Rust）
 
 [build-dependencies]
 winresource = "0.1"        # 给 exe 加图标（assets/app.ico 存在时生效）

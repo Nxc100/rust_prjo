@@ -8,6 +8,9 @@
 #![allow(non_snake_case)]
 
 mod api;
+mod cmode;
+mod cstate;
+mod foursapi;
 mod workflow;
 
 use crossbeam_channel::{Receiver, Sender};
@@ -340,6 +343,26 @@ impl Which {
     }
 }
 
+// 工作台模式：RunningHub 精修/放大 ｜ 人物入景（Workflow C）
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AppMode {
+    RunningHub,
+    Wedding,
+}
+
+// 场景库目录：exe 同目录/assets/wedding 优先；否则项目相对路径（开发时）。
+fn default_scene_dir() -> String {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(d) = exe.parent() {
+            let c = d.join("assets").join("wedding");
+            if c.join("scenes").join("catalog.json").exists() {
+                return c.display().to_string();
+            }
+        }
+    }
+    "assets/wedding".to_string()
+}
+
 // ============ 后台→UI 的消息 ============
 enum Msg {
     Files(Vec<(String, PathBuf)>),
@@ -364,6 +387,23 @@ enum Msg {
     Account(AccountInfo),
     AccountErr(String),
     Finished,
+
+    // —— 人物入景（C 模式）——
+    WOutput { no: String, path: PathBuf }, // 某单出图完成，落地路径
+    WJob {
+        // 自动流水线对某单的字段更新（只更新非 None 项 + 状态）
+        no: String,
+        shot: Option<String>,
+        subjects: Option<u8>,
+        scene: Option<String>,
+        scene_file: Option<String>,
+        output: Option<String>,
+        status: cstate::CStatus,
+    },
+    WThumb { job: usize, is_out: bool, w: usize, h: usize, rgba: Vec<u8> }, // 选中单的原片/结果预览
+    WAccount(foursapi::FsAccount),
+    WAccountErr(String),
+    WFinished,
 }
 
 // ============ 单张图片状态（UI 侧）============
@@ -447,6 +487,31 @@ struct App {
 
     // 主题/字体是否已应用到当前 ctx（首帧懒应用，便于 headless 测试）
     themed: bool,
+
+    // —— 人物入景（C 模式）——
+    mode: AppMode,
+    w_4sapi_key: String,
+    w_access_token: String, // 4sapi 系统访问令牌（查额度用，非 sk-）
+    w_user_id: String,      // 可选 New-Api-User
+    w_account: Option<foursapi::FsAccount>,
+    w_account_err: Option<String>,
+    w_account_loading: bool,
+    w_input_dir: String,
+    w_output_dir: String,
+    w_tone: String,      // 调色 natural|warm|overcast
+    w_series: String,    // 场景概念池（空=全部）
+    w_scene_dir: String, // 场景库目录（含 templates/ scenes/）
+    w_assets: Option<cmode::Assets>,
+    w_assets_err: Option<String>,
+    w_manifest: Option<cstate::CManifest>,
+    w_sel: Option<usize>, // 选中的 job 下标
+    w_running: bool,
+    w_stop: Arc<AtomicBool>,
+    w_in_tex: Option<egui::TextureHandle>,
+    w_out_tex: Option<egui::TextureHandle>,
+    w_tex_job: Option<usize>, // 当前预览纹理属于哪个 job
+    w_in_req: bool,
+    w_out_req: bool,
 }
 
 impl App {
@@ -455,6 +520,7 @@ impl App {
         let (tx, rx) = crossbeam_channel::unbounded();
         let store = load_store();
         let cfg = store.presets[store.current].cfg.clone();
+        let (w_key, w_tok, w_uid) = foursapi::read_credentials();
         Self {
             store,
             cfg,
@@ -488,6 +554,30 @@ impl App {
             cmp_fit_w: 1.0,
             finished_banner: false,
             themed: false,
+
+            mode: AppMode::RunningHub,
+            w_4sapi_key: w_key,
+            w_access_token: w_tok,
+            w_user_id: w_uid,
+            w_account: None,
+            w_account_err: None,
+            w_account_loading: false,
+            w_input_dir: String::new(),
+            w_output_dir: String::new(),
+            w_tone: "natural".into(),
+            w_series: String::new(),
+            w_scene_dir: default_scene_dir(),
+            w_assets: None,
+            w_assets_err: None,
+            w_manifest: None,
+            w_sel: None,
+            w_running: false,
+            w_stop: Arc::new(AtomicBool::new(false)),
+            w_in_tex: None,
+            w_out_tex: None,
+            w_tex_job: None,
+            w_in_req: false,
+            w_out_req: false,
         }
     }
 
@@ -896,6 +986,66 @@ impl App {
                     // 余额变了，刷新一下
                     self.refresh_account();
                 }
+                Msg::WOutput { no, path } => {
+                    if let Some(m) = self.w_manifest.as_mut() {
+                        m.record_outputs(&no, vec![path.display().to_string()]);
+                    }
+                }
+                Msg::WJob { no, shot, subjects, scene, scene_file, output, status } => {
+                    if let Some(m) = self.w_manifest.as_mut() {
+                        if let Some(j) = m.jobs.iter_mut().find(|j| j.no == no) {
+                            if shot.is_some() {
+                                j.shot = shot;
+                            }
+                            if subjects.is_some() {
+                                j.subjects = subjects;
+                            }
+                            if scene.is_some() {
+                                j.scene = scene;
+                            }
+                            if scene_file.is_some() {
+                                j.scene_file = scene_file;
+                            }
+                            if let Some(o) = output {
+                                j.outputs = vec![o];
+                            }
+                            j.status = status;
+                        }
+                    }
+                }
+                Msg::WThumb { job, is_out, w, h, rgba } => {
+                    let color = egui::ColorImage::from_rgba_unmultiplied([w, h], &rgba);
+                    let tex = ctx.load_texture(
+                        format!("w-thumb-{job}-{}", if is_out { "out" } else { "in" }),
+                        color,
+                        egui::TextureOptions::LINEAR,
+                    );
+                    if self.w_sel == Some(job) {
+                        if is_out {
+                            self.w_out_tex = Some(tex);
+                        } else {
+                            self.w_in_tex = Some(tex);
+                        }
+                    }
+                }
+                Msg::WAccount(info) => {
+                    self.w_account = Some(info);
+                    self.w_account_err = None;
+                    self.w_account_loading = false;
+                }
+                Msg::WAccountErr(e) => {
+                    self.w_account = None;
+                    self.w_account_err = Some(e);
+                    self.w_account_loading = false;
+                }
+                Msg::WFinished => {
+                    self.w_running = false;
+                    self.w_save();
+                    if self.cfg.notify_sound {
+                        notify_beep();
+                    }
+                    self.w_refresh_account(ctx); // 出图后额度变了，刷新
+                }
             }
         }
     }
@@ -966,7 +1116,10 @@ impl App {
         }
         let ctx = ui.ctx().clone();
         self.drain(&ctx);
-        self.request_thumbs(&ctx);
+        match self.mode {
+            AppMode::RunningHub => self.request_thumbs(&ctx),
+            AppMode::Wedding => self.w_request_thumbs(&ctx),
+        }
 
         // 拖拽导入
         let dropped = ctx.input(|i| i.raw.dropped_files.clone());
@@ -990,9 +1143,17 @@ impl App {
             spread: 0,
             color: egui::Color32::from_black_alpha(22),
         };
+        let wedding = self.mode == AppMode::Wedding;
         egui::Panel::top("header")
             .frame(panel_frame(pal::SURFACE, 18, 12, header_shadow))
-            .show_inside(ui, |ui| self.header(ui, &ctx));
+            .show_inside(ui, |ui| {
+                self.mode_switch(ui);
+                if wedding {
+                    self.w_header(ui, &ctx);
+                } else {
+                    self.header(ui, &ctx);
+                }
+            });
         let logs_resp = egui::Panel::bottom("logs")
             .resizable(true)
             .default_size(self.store.logs_h)
@@ -1003,11 +1164,23 @@ impl App {
             .resizable(true)
             .default_size(self.store.left_w)
             .frame(panel_frame(pal::PANEL, 12, 10, egui::Shadow::NONE))
-            .show_inside(ui, |ui| self.list_panel(ui));
+            .show_inside(ui, |ui| {
+                if wedding {
+                    self.w_list(ui);
+                } else {
+                    self.list_panel(ui);
+                }
+            });
         self.store.left_w = list_resp.response.rect.width();
         egui::CentralPanel::default()
             .frame(panel_frame(pal::BG, 16, 14, egui::Shadow::NONE))
-            .show_inside(ui, |ui| self.preview_panel(ui));
+            .show_inside(ui, |ui| {
+                if wedding {
+                    self.w_preview(ui);
+                } else {
+                    self.preview_panel(ui);
+                }
+            });
 
         // 拖拽悬停提示
         if ctx.input(|i| !i.raw.hovered_files.is_empty()) {
@@ -1026,7 +1199,7 @@ impl App {
             );
         }
 
-        if self.running {
+        if self.running || self.w_running {
             ctx.request_repaint_after(Duration::from_millis(150));
         }
     }
@@ -1740,13 +1913,11 @@ impl App {
                     egui::vec2((avail_w / 2.0 - 44.0).max(120.0), (avail_h - 92.0).max(160.0));
                 ui.columns(2, |cols| {
                     preview_cell(&mut cols[0], "处理前 · 原图", &in_tex, cell, |ui| {
-                        ui.spinner();
-                        ui.label(egui::RichText::new("加载中…").color(pal::TEXT_WEAK).small());
+                        ui.label(egui::RichText::new("⏳ 加载中…").color(pal::TEXT_WEAK).small());
                     });
                     preview_cell(&mut cols[1], "处理后 · 结果", &out_tex, cell, |ui| {
                         if has_out {
-                            ui.spinner();
-                            ui.label(egui::RichText::new("加载中…").color(pal::TEXT_WEAK).small());
+                            ui.label(egui::RichText::new("⏳ 加载中…").color(pal::TEXT_WEAK).small());
                         } else {
                             empty_after(ui, stage);
                         }
@@ -2003,6 +2174,890 @@ impl App {
             match std::fs::write(&path, self.logs.join("\r\n")) {
                 Ok(()) => self.logs.push(format!("📝 日志已导出：{}", path.display())),
                 Err(e) => self.logs.push(format!("⚠ 日志导出失败：{e}")),
+            }
+        }
+    }
+}
+
+// ============ 人物入景（C 模式）UI ============
+fn shot_label(s: &str) -> &'static str {
+    match s {
+        "full" => "全身",
+        "medium" => "中景",
+        "close" => "近景",
+        "closeup" => "特写",
+        _ => "景别",
+    }
+}
+fn tone_label(s: &str) -> &'static str {
+    match s {
+        "warm" => "暖",
+        "overcast" => "冷",
+        _ => "自然",
+    }
+}
+fn w_status_chip(ui: &mut egui::Ui, st: cstate::CStatus) {
+    let color = match st {
+        cstate::CStatus::Pending => pal::TEXT_WEAK,
+        cstate::CStatus::Prompted => pal::INFO,
+        cstate::CStatus::AwaitingQc => pal::WARN,
+        cstate::CStatus::Selected => pal::ACCENT,
+        cstate::CStatus::Done => pal::SUCCESS,
+        cstate::CStatus::QcFail => pal::ERROR,
+    };
+    egui::Frame {
+        inner_margin: egui::Margin::symmetric(8, 2),
+        outer_margin: egui::Margin::same(0),
+        fill: tint(color, 38),
+        stroke: egui::Stroke::new(1.0, tint(color, 90)),
+        corner_radius: egui::CornerRadius::same(7),
+        shadow: egui::Shadow::NONE,
+    }
+    .show(ui, |ui| {
+        ui.label(egui::RichText::new(st.label()).color(color).small());
+    });
+}
+
+// 人物入景预览解码（后台线程 → Msg::WThumb）。
+fn w_spawn_decode(
+    tx: Sender<Msg>,
+    ctx: egui::Context,
+    job: usize,
+    is_out: bool,
+    path: PathBuf,
+    max: u32,
+) {
+    std::thread::spawn(move || {
+        match decode_thumb(&path, max) {
+            Ok((w, h, rgba)) => {
+                let _ = tx.send(Msg::WThumb { job, is_out, w, h, rgba });
+            }
+            Err(e) => {
+                let _ = tx.send(Msg::Log(format!("⚠ 预览加载失败 {}：{e}", path.display())));
+            }
+        }
+        ctx.request_repaint();
+    });
+}
+
+// 人物入景一键流水线（后台线程）：判景别 → 自动选景排重 → 装配 → 双图出图（断点续跑）。
+#[allow(clippy::too_many_arguments)]
+fn w_pipeline(
+    mut m: cstate::CManifest,
+    assets: cmode::Assets,
+    key: String,
+    out_dir: String,
+    scene_base: PathBuf,
+    client: String,
+    tx: Sender<Msg>,
+    ctx: egui::Context,
+    stop: Arc<AtomicBool>,
+) {
+    let log = |s: String| {
+        let _ = tx.send(Msg::Log(s));
+        ctx.request_repaint();
+    };
+    let cli = match foursapi::FsClient::new(key) {
+        Ok(c) => c,
+        Err(e) => {
+            log(format!("❌ 4sapi 初始化失败：{e}"));
+            let _ = tx.send(Msg::WFinished);
+            ctx.request_repaint();
+            return;
+        }
+    };
+
+    // 阶段 A：判景别 + 人数（缺 shot/subjects 的单；左侧已手填的尊重不覆盖）。
+    for i in 0..m.jobs.len() {
+        if stop.load(Ordering::SeqCst) {
+            break;
+        }
+        let (no, input, need) = {
+            let j = &m.jobs[i];
+            (j.no.clone(), j.input.clone(), j.shot.is_none() || j.subjects.is_none())
+        };
+        if !need {
+            continue;
+        }
+        log(format!("  判景别 {no}…"));
+        let (shot, subj) = match cli.judge_shot(Path::new(&input)) {
+            Ok(v) => v,
+            Err(e) => {
+                log(format!("  ⚠ {no} 判景别失败（默认 全身/双人）：{e}"));
+                ("full".to_string(), 2)
+            }
+        };
+        m.jobs[i].shot = Some(shot.clone());
+        m.jobs[i].subjects = Some(subj);
+        let _ = tx.send(Msg::WJob {
+            no: no.clone(),
+            shot: Some(shot.clone()),
+            subjects: Some(subj),
+            scene: None,
+            scene_file: None,
+            output: None,
+            status: cstate::CStatus::Pending,
+        });
+        log(format!("  {no} → 景别 {} · {}", shot, if subj == 1 { "单人" } else { "双人" }));
+    }
+    if stop.load(Ordering::SeqCst) {
+        log("⏹ 已停止。".into());
+        let _ = tx.send(Msg::WFinished);
+        ctx.request_repaint();
+        return;
+    }
+
+    // 阶段 B：自动选景排重 + 装配。
+    m.auto_plan(&assets.scenes);
+    let _ = m.assemble(&assets);
+    for j in &m.jobs {
+        let _ = tx.send(Msg::WJob {
+            no: j.no.clone(),
+            shot: None,
+            subjects: None,
+            scene: j.scene.clone(),
+            scene_file: j.scene_file.clone(),
+            output: None,
+            status: j.status,
+        });
+    }
+    ctx.request_repaint();
+
+    // 阶段 C：逐单双图出图（输出已存在则跳过＝断点续跑）。
+    let _ = std::fs::create_dir_all(&out_dir);
+    let todo: Vec<usize> = (0..m.jobs.len())
+        .filter(|&i| m.jobs[i].status == cstate::CStatus::Prompted)
+        .collect();
+    for i in todo {
+        if stop.load(Ordering::SeqCst) {
+            break;
+        }
+        let (no, input, prompt, scene_file) = {
+            let j = &m.jobs[i];
+            (
+                j.no.clone(),
+                j.input.clone(),
+                j.prompt.clone().unwrap_or_default(),
+                j.scene_file.clone().unwrap_or_default(),
+            )
+        };
+        if prompt.is_empty() || scene_file.is_empty() {
+            log(format!("  跳过 {no}：未成功装配（catalog 可能缺该景别场景）"));
+            continue;
+        }
+        let outp = Path::new(&out_dir).join(format!("{client}_{no}_c1.png"));
+        if outp.exists() {
+            log(format!("  ⏭ {no} 已有结果，跳过"));
+            let _ = tx.send(Msg::WJob {
+                no,
+                shot: None,
+                subjects: None,
+                scene: None,
+                scene_file: None,
+                output: Some(outp.display().to_string()),
+                status: cstate::CStatus::AwaitingQc,
+            });
+            continue;
+        }
+        let person = PathBuf::from(&input);
+        let plate = scene_base.join(&scene_file);
+        let (w, h) = image::image_dimensions(&person).unwrap_or((1024, 1536));
+        let size = cmode::size_for_aspect(w, h);
+        log(format!("  ▶ 出图 {no}（{size}）…"));
+        match cli.edit_dual(&person, &plate, &prompt, size, "high") {
+            Ok(bytes) => match std::fs::write(&outp, &bytes) {
+                Ok(()) => {
+                    log(format!("  ✓ {no} 完成"));
+                    let _ = tx.send(Msg::WJob {
+                        no,
+                        shot: None,
+                        subjects: None,
+                        scene: None,
+                        scene_file: None,
+                        output: Some(outp.display().to_string()),
+                        status: cstate::CStatus::AwaitingQc,
+                    });
+                }
+                Err(e) => log(format!("  ✗ {no} 写文件失败：{e}")),
+            },
+            Err(e) => log(format!("  ✗ {no} 出图失败：{e}")),
+        }
+    }
+    log(format!(
+        "{}本轮结束（结果在输出夹）。",
+        if stop.load(Ordering::SeqCst) { "⏹ 已停止，" } else { "" }
+    ));
+    let _ = tx.send(Msg::WFinished);
+    ctx.request_repaint();
+}
+
+impl App {
+    fn mode_switch(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("◆").color(pal::ACCENT).size(18.0));
+            ui.add_space(4.0);
+            if ui
+                .selectable_label(self.mode == AppMode::RunningHub, "  RunningHub 精修/放大  ")
+                .clicked()
+            {
+                self.mode = AppMode::RunningHub;
+            }
+            if ui
+                .selectable_label(self.mode == AppMode::Wedding, "  人物入景  ")
+                .clicked()
+            {
+                self.mode = AppMode::Wedding;
+                if self.w_assets.is_none() {
+                    self.w_load_assets();
+                }
+            }
+        });
+        ui.separator();
+    }
+
+    fn w_load_assets(&mut self) {
+        let dir = PathBuf::from(self.w_scene_dir.trim());
+        match cmode::load_from_dir(&dir) {
+            Ok(a) => {
+                self.w_assets = Some(a);
+                self.w_assets_err = None;
+            }
+            Err(e) => {
+                self.w_assets = None;
+                self.w_assets_err = Some(e.to_string());
+            }
+        }
+    }
+
+    // 后台查 4sapi 额度（测试连接）。优先用访问令牌，留空退回 sk- 密钥。
+    fn w_refresh_account(&mut self, ctx: &egui::Context) {
+        let token = self.w_access_token.trim().to_string();
+        let key = self.w_4sapi_key.trim().to_string();
+        if token.is_empty() && key.is_empty() {
+            self.w_account_err = Some("先填访问令牌或 sk- 密钥".into());
+            return;
+        }
+        if self.w_account_loading {
+            return;
+        }
+        self.w_account_loading = true;
+        self.w_account_err = None;
+        let uid = self.w_user_id.trim().to_string();
+        let tx = self.tx.clone();
+        let ctx2 = ctx.clone();
+        std::thread::spawn(move || {
+            match foursapi::FsClient::new(key) {
+                Ok(c) => match c.account(&token, &uid) {
+                    Ok(a) => {
+                        let _ = tx.send(Msg::WAccount(a));
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Msg::WAccountErr(e.to_string()));
+                    }
+                },
+                Err(e) => {
+                    let _ = tx.send(Msg::WAccountErr(e.to_string()));
+                }
+            }
+            ctx2.request_repaint();
+        });
+    }
+
+    fn w_manifest_path(&self) -> Option<PathBuf> {
+        let dir = self.w_output_dir.trim();
+        let m = self.w_manifest.as_ref()?;
+        if dir.is_empty() {
+            return None;
+        }
+        Some(Path::new(dir).join(format!("{}_manifest.json", m.client)))
+    }
+    fn w_save(&self) {
+        if let (Some(m), Some(p)) = (&self.w_manifest, self.w_manifest_path()) {
+            let _ = m.save(&p);
+        }
+    }
+
+    fn w_header(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        ui.horizontal(|ui| {
+            ui.heading(egui::RichText::new("人物入景").color(pal::TEXT));
+            ui.add_space(6.0);
+            ui.label(egui::RichText::new("真人原片 → 场景库 → 自动选景装配 → 双图出图（gpt-image-2）").color(pal::TEXT_WEAK).small());
+        });
+        ui.add_space(8.0);
+
+        // 配置行 1：4sapi Key / 调色 / 场景池
+        ui.horizontal(|ui| {
+            field_label(ui, "4sapi Key");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.w_4sapi_key)
+                    .password(true)
+                    .desired_width(240.0)
+                    .hint_text("key.txt 自动读取"),
+            );
+            ui.add_space(8.0);
+            ui.label("调色");
+            egui::ComboBox::from_id_salt("w_tone")
+                .selected_text(tone_label(&self.w_tone))
+                .width(64.0)
+                .show_ui(ui, |ui| {
+                    for v in ["natural", "warm", "overcast"] {
+                        if ui.selectable_label(self.w_tone == v, tone_label(v)).clicked() {
+                            self.w_tone = v.into();
+                        }
+                    }
+                });
+            ui.add_space(8.0);
+            ui.label("场景池");
+            let serieses: Vec<String> = {
+                let mut v: Vec<String> = Vec::new();
+                if let Some(a) = &self.w_assets {
+                    for s in &a.scenes {
+                        if !v.contains(&s.series) {
+                            v.push(s.series.clone());
+                        }
+                    }
+                }
+                v
+            };
+            let cur = if self.w_series.is_empty() { "全部".to_string() } else { self.w_series.clone() };
+            egui::ComboBox::from_id_salt("w_series")
+                .selected_text(cur)
+                .width(96.0)
+                .show_ui(ui, |ui| {
+                    if ui.selectable_label(self.w_series.is_empty(), "全部").clicked() {
+                        self.w_series.clear();
+                    }
+                    for s in &serieses {
+                        if ui.selectable_label(&self.w_series == s, s).clicked() {
+                            self.w_series = s.clone();
+                        }
+                    }
+                });
+        });
+
+        // 额度 / 测试连接（访问令牌：4sapi 个人设置→系统访问令牌；非 sk- 出图密钥）
+        ui.horizontal(|ui| {
+            field_label(ui, "访问令牌");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.w_access_token)
+                    .password(true)
+                    .desired_width(200.0)
+                    .hint_text("个人设置→系统访问令牌（查额度用，可留空）"),
+            );
+            ui.add_space(6.0);
+            ui.label("用户ID");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.w_user_id)
+                    .desired_width(72.0)
+                    .hint_text("可留空"),
+            );
+            if ui.add_sized([84.0, 28.0], egui::Button::new("测试 / 刷新")).clicked() {
+                self.w_refresh_account(ctx);
+            }
+            if self.w_account_loading {
+                ui.label(egui::RichText::new("查询中…").color(pal::TEXT_WEAK).small());
+            } else if let Some(a) = &self.w_account {
+                let low = a.remain_usd() <= 1.0;
+                count_chip(
+                    ui,
+                    format!("🪙 余额 ≈ ${:.2}", a.remain_usd()),
+                    if low { pal::ERROR } else { pal::ACCENT },
+                );
+                if !a.group.is_empty() {
+                    count_chip(ui, format!("组 {}", a.group), pal::INFO);
+                }
+                ui.label(
+                    egui::RichText::new(format!("已用 ${:.2}", a.used_usd()))
+                        .color(pal::TEXT_WEAK)
+                        .small(),
+                );
+            } else if let Some(e) = &self.w_account_err {
+                ui.label(egui::RichText::new(format!("⚠ {e}")).color(pal::ERROR).small());
+            }
+        });
+
+        // 配置行 2/3：原片 / 输出文件夹
+        ui.horizontal(|ui| {
+            field_label(ui, "原片文件夹");
+            let bw = 64.0;
+            let w = (ui.available_width() - bw - 8.0).max(140.0);
+            ui.add(
+                egui::TextEdit::singleline(&mut self.w_input_dir)
+                    .desired_width(w)
+                    .hint_text("某客户的人物原片文件夹（文件夹名=客户名）"),
+            );
+            if ui.add_sized([bw, 30.0], egui::Button::new("浏览…")).clicked() {
+                if let Some(p) = rfd::FileDialog::new().pick_folder() {
+                    self.w_input_dir = p.display().to_string();
+                }
+            }
+        });
+        ui.horizontal(|ui| {
+            field_label(ui, "输出文件夹");
+            let bw = 64.0;
+            let w = (ui.available_width() - bw - 8.0).max(140.0);
+            ui.add(egui::TextEdit::singleline(&mut self.w_output_dir).desired_width(w));
+            if ui.add_sized([bw, 30.0], egui::Button::new("浏览…")).clicked() {
+                if let Some(p) = rfd::FileDialog::new().pick_folder() {
+                    self.w_output_dir = p.display().to_string();
+                }
+            }
+        });
+
+        // 场景库目录（可编辑 + 浏览 + 加载）
+        ui.horizontal(|ui| {
+            field_label(ui, "场景库");
+            let bw = 60.0;
+            let w = (ui.available_width() - bw * 2.0 - 16.0).max(140.0);
+            ui.add(
+                egui::TextEdit::singleline(&mut self.w_scene_dir)
+                    .desired_width(w)
+                    .hint_text("含 templates/ 与 scenes/ 的目录"),
+            );
+            if ui.add_sized([bw, 30.0], egui::Button::new("浏览…")).clicked() {
+                if let Some(p) = rfd::FileDialog::new().pick_folder() {
+                    self.w_scene_dir = p.display().to_string();
+                    self.w_load_assets();
+                }
+            }
+            if ui.add_sized([bw, 30.0], egui::Button::new("加载")).clicked() {
+                self.w_load_assets();
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.add_space(96.0);
+            if let Some(a) = &self.w_assets {
+                ui.label(
+                    egui::RichText::new(format!("✓ 已加载 {} 张 plate", a.scenes.len()))
+                        .color(pal::SUCCESS)
+                        .small(),
+                );
+            } else {
+                let msg = self.w_assets_err.clone().unwrap_or_else(|| "未加载（填好目录点「加载」）".into());
+                ui.label(egui::RichText::new(format!("⚠ {msg}")).color(pal::WARN).small());
+            }
+        });
+
+        ui.add_space(10.0);
+        // —— 一键自动流水线 ——
+        let has_sel = self
+            .w_manifest
+            .as_ref()
+            .map_or(false, |m| m.jobs.iter().any(|j| j.status == cstate::CStatus::Selected));
+        ui.horizontal(|ui| {
+            if !self.w_running {
+                let b = egui::Button::new(
+                    egui::RichText::new("▶  开始").size(15.0).strong().color(pal::ON_ACCENT),
+                )
+                .fill(pal::ACCENT)
+                .min_size(egui::vec2(150.0, 34.0))
+                .corner_radius(egui::CornerRadius::same(10));
+                if ui
+                    .add(b)
+                    .on_hover_text("自动：判景别 → 选景装配 → 双图出图 → 落到输出夹（已存在结果自动跳过）")
+                    .clicked()
+                {
+                    self.w_start(ctx);
+                }
+            } else {
+                let b = egui::Button::new(
+                    egui::RichText::new("■  停止").size(15.0).strong().color(pal::ON_ACCENT),
+                )
+                .fill(pal::ERROR)
+                .min_size(egui::vec2(110.0, 34.0))
+                .corner_radius(egui::CornerRadius::same(10));
+                if ui.add(b).clicked() {
+                    self.w_stop.store(true, Ordering::SeqCst);
+                    self.logs.push("⏹ 已请求停止，等当前一张结束…".into());
+                }
+                ui.label(egui::RichText::new("● 处理中").color(pal::INFO).small());
+            }
+            if ui
+                .add_enabled(!self.w_running && has_sel, egui::Button::new("归集已选"))
+                .on_hover_text("把 QC 选用的片归档到 输出/final")
+                .clicked()
+            {
+                self.w_collect();
+            }
+            if ui
+                .add_enabled(!self.w_output_dir.trim().is_empty(), egui::Button::new("📂 输出夹"))
+                .clicked()
+            {
+                open_folder(&self.w_output_dir);
+            }
+        });
+
+        // 进度 + 统计
+        if let Some(m) = &self.w_manifest {
+            let tot = m.jobs.len();
+            let produced = m.jobs.iter().filter(|j| !j.outputs.is_empty()).count();
+            let fail = m.jobs.iter().filter(|j| j.status == cstate::CStatus::QcFail).count();
+            if tot > 0 {
+                ui.add_space(8.0);
+                let frac = produced as f32 / tot as f32;
+                ui.add(
+                    egui::ProgressBar::new(frac)
+                        .desired_height(16.0)
+                        .corner_radius(egui::CornerRadius::same(8))
+                        .fill(pal::ACCENT)
+                        .text(
+                            egui::RichText::new(format!("{produced} / {tot}   {:.0}%", frac * 100.0))
+                                .color(pal::TEXT)
+                                .small(),
+                        ),
+                );
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    count_chip(ui, format!("✓ 已出图 {produced}"), pal::SUCCESS);
+                    count_chip(ui, format!("共 {tot}"), pal::TEXT_WEAK);
+                    if fail > 0 {
+                        count_chip(ui, format!("✗ 失败/废 {fail}"), pal::ERROR);
+                    }
+                });
+            }
+        }
+    }
+
+    fn w_init(&mut self) {
+        let dir = self.w_input_dir.trim().to_string();
+        if dir.is_empty() {
+            self.logs.push("❌ 先选原片文件夹".into());
+            return;
+        }
+        let path = PathBuf::from(&dir);
+        let client = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("client")
+            .to_string();
+        match cstate::CManifest::init(&client, &path) {
+            Ok(mut m) => {
+                m.key = self.w_tone.clone();
+                m.series = if self.w_series.is_empty() { None } else { Some(self.w_series.clone()) };
+                self.logs.push(format!("✅ 建账「{client}」：{} 单。逐单选景别/人数 → 排片 → 装配 → 出图。", m.jobs.len()));
+                self.w_manifest = Some(m);
+                self.w_sel = Some(0);
+                self.w_save();
+            }
+            Err(e) => self.logs.push(format!("❌ 建账失败：{e}")),
+        }
+    }
+
+    // 一键自动流水线：建账 → 后台(判景别 → 选景装配 → 双图出图)。
+    fn w_start(&mut self, ctx: &egui::Context) {
+        let key = self.w_4sapi_key.trim().to_string();
+        if key.is_empty() {
+            self.logs.push("❌ 4sapi Key 为空（放 key.txt 或手填）".into());
+            return;
+        }
+        let in_dir = self.w_input_dir.trim().to_string();
+        let out_dir = self.w_output_dir.trim().to_string();
+        if in_dir.is_empty() {
+            self.logs.push("❌ 先选原片文件夹".into());
+            return;
+        }
+        if out_dir.is_empty() {
+            self.logs.push("❌ 先选输出文件夹".into());
+            return;
+        }
+        let assets = match &self.w_assets {
+            Some(a) => a.clone(),
+            None => {
+                self.logs.push("❌ 场景库未加载（填好场景库目录点「加载」）".into());
+                return;
+            }
+        };
+        let path = PathBuf::from(&in_dir);
+        let client = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("client")
+            .to_string();
+        let mut m = match cstate::CManifest::init(&client, &path) {
+            Ok(m) => m,
+            Err(e) => {
+                self.logs.push(format!("❌ 建账失败：{e}"));
+                return;
+            }
+        };
+        m.key = self.w_tone.clone();
+        m.series = if self.w_series.is_empty() { None } else { Some(self.w_series.clone()) };
+        self.w_manifest = Some(m.clone());
+        self.w_sel = Some(0);
+        self.w_running = true;
+        self.w_stop = Arc::new(AtomicBool::new(false));
+        self.w_save();
+        self.logs.push(format!(
+            "▶ 开始「{}」：{} 张 → 自动判景别({}) → 选景装配 → 双图出图（已存在结果自动跳过）",
+            client,
+            m.jobs.len(),
+            foursapi::VISION_MODEL
+        ));
+        let scene_base = PathBuf::from(self.w_scene_dir.trim());
+        let tx = self.tx.clone();
+        let ctx2 = ctx.clone();
+        let stop = self.w_stop.clone();
+        std::thread::spawn(move || w_pipeline(m, assets, key, out_dir, scene_base, client, tx, ctx2, stop));
+    }
+
+    fn w_collect(&mut self) {
+        let out_dir = self.w_output_dir.trim().to_string();
+        if out_dir.is_empty() {
+            self.logs.push("❌ 先选输出文件夹".into());
+            return;
+        }
+        let final_dir = Path::new(&out_dir).join("final");
+        let res = self.w_manifest.as_mut().map(|m| m.collect(&final_dir));
+        match res {
+            Some(Ok((done, ups))) => {
+                self.logs.push(format!("✅ 归集 {} 张 → {}", done.len(), final_dir.display()));
+                if !ups.is_empty() {
+                    self.logs.push(format!(
+                        "⚠ 需放大（长边<{}px，可切到 RunningHub 高清放大）：{}",
+                        cstate::UPSCALE_EDGE,
+                        ups.join(", ")
+                    ));
+                }
+                self.w_save();
+            }
+            Some(Err(e)) => self.logs.push(format!("❌ 归集失败：{e}")),
+            None => {}
+        }
+    }
+
+    fn w_select(&mut self, no: &str, pick: &str) {
+        let le = image::image_dimensions(Path::new(pick)).map(|(w, h)| w.max(h)).unwrap_or(0);
+        if let Some(m) = self.w_manifest.as_mut() {
+            let _ = m.select(no, pick, le);
+        }
+        self.logs.push(format!("✓ {no} 选用（长边 {le}px）"));
+        self.w_save();
+    }
+    fn w_fail(&mut self, no: &str) {
+        if let Some(m) = self.w_manifest.as_mut() {
+            let _ = m.fail(no, "QC 不过");
+        }
+        self.logs.push(format!("✗ {no} 判废（可重装配/重出）"));
+        self.w_save();
+    }
+
+    fn w_list(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("单子列表").color(pal::TEXT).strong());
+            if let Some(m) = &self.w_manifest {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(egui::RichText::new(format!("{} 单", m.jobs.len())).color(pal::TEXT_WEAK).small());
+                });
+            }
+        });
+        ui.add_space(6.0);
+        if self.w_manifest.is_none() {
+            ui.add_space(20.0);
+            ui.vertical_centered(|ui| {
+                ui.label(egui::RichText::new("填好上方配置后点「① 建账」").color(pal::TEXT_WEAK).small());
+            });
+            return;
+        }
+        let scenes = self.w_assets.as_ref().map(|a| a.scenes.clone()).unwrap_or_default();
+        let snapshot: Vec<(String, Option<String>, Option<u8>, Option<String>, cstate::CStatus)> = self
+            .w_manifest
+            .as_ref()
+            .unwrap()
+            .jobs
+            .iter()
+            .map(|j| (j.no.clone(), j.shot.clone(), j.subjects, j.scene.clone(), j.status))
+            .collect();
+        let mut click: Option<usize> = None;
+        let mut edits: Vec<(String, Option<String>, Option<u8>)> = Vec::new();
+        egui::ScrollArea::vertical()
+            .id_salt("w_list_scroll")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                for (i, (no, shot, subj, scene, status)) in snapshot.iter().enumerate() {
+                    let selected = self.w_sel == Some(i);
+                    let bg = if selected { tint(pal::ACCENT, 36) } else { egui::Color32::TRANSPARENT };
+                    egui::Frame {
+                        inner_margin: egui::Margin::symmetric(6, 5),
+                        outer_margin: egui::Margin::same(0),
+                        fill: bg,
+                        stroke: egui::Stroke::NONE,
+                        corner_radius: egui::CornerRadius::same(8),
+                        shadow: egui::Shadow::NONE,
+                    }
+                    .show(ui, |ui| {
+                        ui.set_min_width(ui.available_width());
+                        ui.horizontal(|ui| {
+                            if ui
+                                .selectable_label(selected, egui::RichText::new(format!("#{no}")).strong())
+                                .clicked()
+                            {
+                                click = Some(i);
+                            }
+                            let cur = shot.clone().unwrap_or_default();
+                            egui::ComboBox::from_id_salt(format!("w_shot_{no}"))
+                                .selected_text(if cur.is_empty() { "景别".into() } else { shot_label(&cur).to_string() })
+                                .width(64.0)
+                                .show_ui(ui, |ui| {
+                                    for s in ["full", "medium", "close", "closeup"] {
+                                        if ui.selectable_label(cur == s, shot_label(s)).clicked() {
+                                            edits.push((no.clone(), Some(s.to_string()), None));
+                                        }
+                                    }
+                                });
+                            if ui.selectable_label(*subj == Some(1), "单").clicked() {
+                                edits.push((no.clone(), None, Some(1)));
+                            }
+                            if ui.selectable_label(*subj == Some(2), "双").clicked() {
+                                edits.push((no.clone(), None, Some(2)));
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            w_status_chip(ui, *status);
+                            if let Some(sc) = scene {
+                                ui.label(egui::RichText::new(sc).color(pal::TEXT_WEAK).small());
+                            }
+                        });
+                    });
+                }
+            });
+        if let Some(i) = click {
+            self.w_sel = Some(i);
+        }
+        if !edits.is_empty() {
+            for (no, shot, subj) in edits {
+                if let Some(m) = self.w_manifest.as_mut() {
+                    if let Err(e) = m.set_job(&no, shot, subj, None, &scenes) {
+                        self.logs.push(format!("⚠ {no}：{e}"));
+                    }
+                }
+            }
+            self.w_save();
+        }
+    }
+
+    fn w_preview(&mut self, ui: &mut egui::Ui) {
+        let Some(i) = self.w_sel else {
+            ui.add_space(60.0);
+            ui.vertical_centered(|ui| {
+                ui.label(egui::RichText::new("🖼").size(40.0).color(pal::TEXT_WEAK));
+                ui.add_space(10.0);
+                ui.label(egui::RichText::new("从左侧选择单子查看 原片 / 结果，并 QC 选片").color(pal::TEXT_WEAK));
+            });
+            return;
+        };
+        let (no, status, shot, subj, scene, input, outputs, needs_up) = {
+            let Some(m) = &self.w_manifest else { return };
+            let Some(j) = m.jobs.get(i) else {
+                self.w_sel = None;
+                return;
+            };
+            (
+                j.no.clone(),
+                j.status,
+                j.shot.clone(),
+                j.subjects,
+                j.scene.clone(),
+                j.input.clone(),
+                j.outputs.clone(),
+                j.needs_upscale,
+            )
+        };
+
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(format!("#{no}")).color(pal::TEXT).strong());
+            w_status_chip(ui, status);
+            if let Some(s) = &shot {
+                ui.label(egui::RichText::new(shot_label(s)).color(pal::TEXT_WEAK).small());
+            }
+            ui.label(
+                egui::RichText::new(match subj {
+                    Some(1) => "单人",
+                    Some(2) => "双人",
+                    _ => "人数未定",
+                })
+                .color(pal::TEXT_WEAK)
+                .small(),
+            );
+            if let Some(sc) = &scene {
+                ui.label(egui::RichText::new(format!("场景 {sc}")).color(pal::TEXT_WEAK).small());
+            }
+        });
+        ui.add_space(8.0);
+
+        let avail_w = ui.available_width();
+        let avail_h = ui.available_height();
+        let cell = egui::vec2((avail_w / 2.0 - 44.0).max(120.0), (avail_h - 110.0).max(160.0));
+        let in_tex = self.w_in_tex.clone();
+        let out_tex = self.w_out_tex.clone();
+        let has_out = !outputs.is_empty();
+        ui.columns(2, |cols| {
+            preview_cell(&mut cols[0], "原片", &in_tex, cell, |ui| {
+                ui.label(egui::RichText::new("⏳ 加载中…").color(pal::TEXT_WEAK).small());
+            });
+            preview_cell(&mut cols[1], "结果候选", &out_tex, cell, |ui| {
+                if has_out {
+                    ui.label(egui::RichText::new("⏳ 加载中…").color(pal::TEXT_WEAK).small());
+                } else {
+                    let (txt, col) = match status {
+                        cstate::CStatus::QcFail => ("已判废", pal::WARN),
+                        cstate::CStatus::Prompted => ("待出图（点上方④）", pal::INFO),
+                        _ => ("尚未出图", pal::TEXT_WEAK),
+                    };
+                    ui.label(egui::RichText::new(txt).color(col));
+                }
+            });
+        });
+
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            if open_btn(ui, "🖼  打开原片") {
+                open_file(Path::new(&input));
+            }
+            if has_out && open_btn(ui, "🔍  打开结果") {
+                open_file(Path::new(&outputs[0]));
+            }
+            if has_out && matches!(status, cstate::CStatus::AwaitingQc | cstate::CStatus::Selected) {
+                let pick = outputs[0].clone();
+                if ui.button("✓ 选用").clicked() {
+                    self.w_select(&no, &pick);
+                }
+                if ui.button("✗ 判废").clicked() {
+                    self.w_fail(&no);
+                }
+            }
+            if status == cstate::CStatus::Selected {
+                let tag = if needs_up == Some(true) { "已选片 · 需放大" } else { "已选片" };
+                ui.label(egui::RichText::new(tag).color(pal::SUCCESS).small());
+            }
+        });
+    }
+
+    // 选中单的原片/结果按需解码（全分辨率，切换时释放重解）。
+    fn w_request_thumbs(&mut self, ctx: &egui::Context) {
+        let Some(i) = self.w_sel else { return };
+        if self.w_tex_job != Some(i) {
+            self.w_tex_job = Some(i);
+            self.w_in_tex = None;
+            self.w_out_tex = None;
+            self.w_in_req = false;
+            self.w_out_req = false;
+        }
+        let (input, out0) = {
+            let Some(m) = &self.w_manifest else { return };
+            let Some(j) = m.jobs.get(i) else { return };
+            (j.input.clone(), j.outputs.first().cloned())
+        };
+        let cap = (ctx.input(|i| i.max_texture_side) as u32)
+            .min(PREVIEW_MAX)
+            .max(LIST_THUMB_MAX);
+        if self.w_in_tex.is_none() && !self.w_in_req {
+            self.w_in_req = true;
+            w_spawn_decode(self.tx.clone(), ctx.clone(), i, false, PathBuf::from(input), cap);
+        }
+        if let Some(o) = out0 {
+            if self.w_out_tex.is_none() && !self.w_out_req {
+                self.w_out_req = true;
+                w_spawn_decode(self.tx.clone(), ctx.clone(), i, true, PathBuf::from(o), cap);
             }
         }
     }
@@ -3128,6 +4183,26 @@ mod tests {
         assert_eq!(ov[0]["fieldName"], "seed");
         assert_eq!(ov[0]["fieldValue"], serde_json::json!(123456i64), "数字按数字注入");
     }
+
+    #[test]
+    fn wedding_init_builds_manifest() {
+        // C 模式建账：只收图片、写回调色，建出 manifest。
+        let base = std::env::temp_dir().join("vc_w_init_test");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(base.join("a.jpg"), b"x").unwrap();
+        std::fs::write(base.join("b.png"), b"x").unwrap();
+        std::fs::write(base.join("note.txt"), b"x").unwrap();
+        let mut app = App::new_headless();
+        app.w_input_dir = base.display().to_string();
+        app.w_tone = "warm".into();
+        app.w_init();
+        let m = app.w_manifest.as_ref().expect("应建账成功");
+        assert_eq!(m.jobs.len(), 2, "只收图片、忽略 txt");
+        assert_eq!(m.key, "warm");
+        assert_eq!(app.w_sel, Some(0));
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }
 
 // ============ UI 层测试（egui_kittest 模拟点击/渲染真实控件树）============
@@ -3230,6 +4305,7 @@ mod ui_tests {
     #[test]
     fn compare_mode_toggle_to_wipe() {
         let mut h = harness();
+        h.state_mut().show_settings = false; // 收起设置，给中央对比区完整高度（同 list_filter 测试）
         h.state_mut().items = vec![item("a", Stage::Done)];
         h.state_mut().selected = Some(0);
         h.run();
@@ -3248,6 +4324,18 @@ mod ui_tests {
             h.query_by_label_contains("重试失败项 (2)").is_some(),
             "有 2 个失败项时应出现“重试失败项 (2)”按钮"
         );
+    }
+
+    #[test]
+    fn wedding_mode_switch_renders() {
+        let mut h = harness();
+        h.state_mut().show_settings = false;
+        h.state_mut().mode = AppMode::Wedding;
+        h.run();
+        // 用唯一的 field_label 断言（C 模式配置表单已渲染）
+        assert!(h.query_by_label("原片文件夹").is_some(), "应渲染 C 模式原片文件夹");
+        assert!(h.query_by_label("输出文件夹").is_some(), "应渲染 C 模式输出文件夹");
+        assert!(h.query_by_label("场景库").is_some(), "应渲染场景库状态行");
     }
 }
 
