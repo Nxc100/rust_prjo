@@ -24,6 +24,7 @@ use std::time::{Duration, Instant};
 use api::{AccountInfo, CreateOutcome, PollState, RhClient, RhSettings};
 
 const APP_TITLE: &str = "视觉海岸批量处理工作台";
+const APP_VERSION: &str = env!("CARGO_PKG_VERSION"); // 版本号（取自 Cargo.toml，迭代时改那里）
 const CONFIG_FILE: &str = "vc_batch_config.json";
 const IMAGE_EXTS: [&str; 5] = ["png", "jpg", "jpeg", "webp", "bmp"];
 const PREVIEW_MAX: u32 = 8192; // 预览大图最长边像素（再按 GPU 纹理上限夹紧）；放大对比需要全分辨率才不发虚
@@ -128,6 +129,31 @@ impl Default for Preset {
     }
 }
 
+// 人物入景（C 模式）持久化配置：场景库路径（局域网共享）+ 常用选项，设一次记住。
+// 凭据（sk-/系统令牌/用户ID）不存这里，走 key.txt。
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(default)]
+struct WeddingCfg {
+    scene_dir: String,
+    output_dir: String,
+    tone: String,
+    series: String,
+    concurrency: usize,
+    skip_done: bool,
+}
+impl Default for WeddingCfg {
+    fn default() -> Self {
+        Self {
+            scene_dir: String::new(),
+            output_dir: String::new(),
+            tone: "natural".into(),
+            series: String::new(),
+            concurrency: 2,
+            skip_done: true,
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(default)]
 struct Store {
@@ -137,6 +163,12 @@ struct Store {
     win_h: f32,
     left_w: f32,
     logs_h: f32,
+    #[serde(default = "default_win_scale")]
+    win_scale: f32, // 界面缩放（与系统 DPI 无关，跨机一致；用户可 ± 调）
+    wedding: WeddingCfg,
+}
+fn default_win_scale() -> f32 {
+    1.0
 }
 impl Default for Store {
     fn default() -> Self {
@@ -147,6 +179,8 @@ impl Default for Store {
             win_h: 800.0,
             left_w: 340.0,
             logs_h: 140.0,
+            win_scale: 1.0,
+            wedding: WeddingCfg::default(),
         }
     }
 }
@@ -169,6 +203,9 @@ impl Store {
         }
         if !(self.logs_h.is_finite() && self.logs_h >= 60.0) {
             self.logs_h = 140.0;
+        }
+        if !(self.win_scale.is_finite() && (0.7..=2.0).contains(&self.win_scale)) {
+            self.win_scale = 1.0;
         }
         self
     }
@@ -381,7 +418,11 @@ impl WListFilter {
     }
 }
 
-// 场景库目录：exe 同目录/assets/wedding 优先；否则项目相对路径（开发时）。
+// 局域网共享场景库（不再随程序打包；主机维护、全员共用）。同事程序默认从这里读。
+const SHARED_SCENE_DIR: &str = r"\\DESKTOP-66773HC\ai_work\wedding_scene_lib";
+
+// 默认场景库目录：① exe 同目录捆绑的 assets/wedding（若存在，开发/便携用）；② 否则用局域网共享。
+// 实际值会被持久化的配置覆盖（用户在界面改过就记住）。
 fn default_scene_dir() -> String {
     if let Ok(exe) = std::env::current_exe() {
         if let Some(d) = exe.parent() {
@@ -391,7 +432,22 @@ fn default_scene_dir() -> String {
             }
         }
     }
-    "assets/wedding".to_string()
+    SHARED_SCENE_DIR.to_string()
+}
+
+// 单选/多选图片对话框（支持的图片扩展名）。
+fn pick_image_files() -> Vec<PathBuf> {
+    rfd::FileDialog::new()
+        .add_filter("图片", &IMAGE_EXTS)
+        .pick_files()
+        .unwrap_or_default()
+}
+fn is_image_file(p: &Path) -> bool {
+    p.is_file()
+        && p.extension()
+            .and_then(|s| s.to_str())
+            .map(|e| IMAGE_EXTS.contains(&e.to_lowercase().as_str()))
+            .unwrap_or(false)
 }
 
 // ============ 后台→UI 的消息 ============
@@ -528,6 +584,7 @@ struct App {
     w_account_err: Option<String>,
     w_account_loading: bool,
     w_input_dir: String,
+    w_input_files: Vec<PathBuf>, // 单独选/拖入的图片（与文件夹叠加）
     w_output_dir: String,
     w_tone: String,      // 调色 natural|warm|overcast
     w_series: String,    // 场景概念池（空=全部）
@@ -555,6 +612,17 @@ impl App {
         let store = load_store();
         let cfg = store.presets[store.current].cfg.clone();
         let (w_key, w_tok, w_uid) = foursapi::read_credentials();
+        let wc = store.wedding.clone();
+        let w_scene_dir = if wc.scene_dir.trim().is_empty() {
+            default_scene_dir()
+        } else {
+            wc.scene_dir.clone()
+        };
+        let w_tone = if wc.tone.trim().is_empty() { "natural".to_string() } else { wc.tone.clone() };
+        let w_output_dir = wc.output_dir.clone();
+        let w_series = wc.series.clone();
+        let w_concurrency = wc.concurrency.clamp(1, 8);
+        let w_skip_done = wc.skip_done;
         Self {
             store,
             cfg,
@@ -597,12 +665,13 @@ impl App {
             w_account_err: None,
             w_account_loading: false,
             w_input_dir: String::new(),
-            w_output_dir: String::new(),
-            w_tone: "natural".into(),
-            w_series: String::new(),
-            w_scene_dir: default_scene_dir(),
-            w_concurrency: 2,
-            w_skip_done: true,
+            w_input_files: Vec::new(),
+            w_output_dir,
+            w_tone,
+            w_series,
+            w_scene_dir,
+            w_concurrency,
+            w_skip_done,
             w_list_filter: WListFilter::All,
             w_assets: None,
             w_assets_err: None,
@@ -643,6 +712,15 @@ impl App {
         if let Some(p) = self.store.presets.get_mut(i) {
             p.cfg = self.cfg.clone();
         }
+        // 人物入景配置（含场景库共享路径）一并落盘，下次启动记住。
+        self.store.wedding = WeddingCfg {
+            scene_dir: self.w_scene_dir.clone(),
+            output_dir: self.w_output_dir.clone(),
+            tone: self.w_tone.clone(),
+            series: self.w_series.clone(),
+            concurrency: self.w_concurrency,
+            skip_done: self.w_skip_done,
+        };
         save_store(&self.store);
     }
 
@@ -1152,16 +1230,28 @@ impl App {
             self.themed = true;
         }
         let ctx = ui.ctx().clone();
+
+        // 统一界面缩放：抵消各机系统 DPI 差异 → 跨机一致（effective ppp = win_scale）。
+        // 用户可在右上角 ± 调，记住在配置里。
+        let native = ctx.native_pixels_per_point().unwrap_or(1.0);
+        let target_zoom = (self.store.win_scale / native).clamp(0.4, 3.0);
+        if (ctx.zoom_factor() - target_zoom).abs() > 0.005 {
+            ctx.set_zoom_factor(target_zoom);
+        }
+
         self.drain(&ctx);
         match self.mode {
             AppMode::RunningHub => self.request_thumbs(&ctx),
             AppMode::Wedding => self.w_request_thumbs(&ctx),
         }
 
-        // 拖拽导入
+        // 拖拽导入（按模式分流）
         let dropped = ctx.input(|i| i.raw.dropped_files.clone());
         if !dropped.is_empty() {
-            self.handle_drop(dropped);
+            match self.mode {
+                AppMode::RunningHub => self.handle_drop(dropped),
+                AppMode::Wedding => self.w_handle_drop(dropped),
+            }
         }
 
         // 记忆窗口尺寸（用于下次启动还原）
@@ -1450,17 +1540,33 @@ impl App {
         });
 
         ui.horizontal(|ui| {
-            field_label(ui, "输入文件夹");
-            let bw = 64.0;
-            let w = (ui.available_width() - bw - 8.0).max(140.0);
+            field_label(ui, "输入素材");
+            let bw = 62.0;
+            let w = (ui.available_width() - bw * 2.0 - 12.0).max(120.0);
             ui.add(
                 egui::TextEdit::singleline(&mut self.cfg.input_dir)
-                    .hint_text("也可直接把文件夹/图片拖进窗口")
+                    .hint_text("选文件夹批量；或「选图」单/多选；也可拖拽进窗口")
                     .desired_width(w),
             );
-            if ui.add_sized([bw, 30.0], egui::Button::new("浏览…")).clicked() {
+            if ui.add_sized([bw, 30.0], egui::Button::new("文件夹…")).clicked() {
                 if let Some(p) = rfd::FileDialog::new().pick_folder() {
                     self.cfg.input_dir = p.display().to_string();
+                }
+            }
+            if ui
+                .add_sized([bw, 30.0], egui::Button::new("选图…"))
+                .on_hover_text("单选/多选图片（不必整文件夹），与文件夹叠加")
+                .clicked()
+            {
+                let mut n = 0;
+                for p in pick_image_files() {
+                    if !self.extra_files.contains(&p) {
+                        self.extra_files.push(p);
+                        n += 1;
+                    }
+                }
+                if n > 0 {
+                    self.logs.push(format!("➕ 选入 {n} 张图片（共 {} 张附加）", self.extra_files.len()));
                 }
             }
         });
@@ -2574,6 +2680,25 @@ impl App {
                     self.w_load_assets();
                 }
             }
+            // 右上角：界面缩放（跨机一致，可调）+ 版本号
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(egui::RichText::new(format!("v{APP_VERSION}")).color(pal::TEXT_WEAK).small());
+                ui.add_space(12.0);
+                if ui.small_button("＋").on_hover_text("界面放大").clicked() {
+                    self.store.win_scale = (self.store.win_scale + 0.1).min(2.0);
+                    self.save_all();
+                }
+                ui.label(
+                    egui::RichText::new(format!("{:.0}%", self.store.win_scale * 100.0))
+                        .color(pal::TEXT)
+                        .small(),
+                );
+                if ui.small_button("－").on_hover_text("界面缩小").clicked() {
+                    self.store.win_scale = (self.store.win_scale - 0.1).max(0.7);
+                    self.save_all();
+                }
+                ui.label(egui::RichText::new("缩放").color(pal::TEXT_WEAK).small());
+            });
         });
         ui.separator();
     }
@@ -2589,6 +2714,25 @@ impl App {
                 self.w_assets = None;
                 self.w_assets_err = Some(e.to_string());
             }
+        }
+        self.save_all(); // 记住场景库路径（含局域网共享路径）等配置
+    }
+
+    // 人物入景拖拽：文件夹→设原片文件夹；图片→追加到单独选的原片。
+    fn w_handle_drop(&mut self, dropped: Vec<egui::DroppedFile>) {
+        let mut added = 0;
+        for f in dropped {
+            let Some(p) = f.path else { continue };
+            if p.is_dir() {
+                self.w_input_dir = p.display().to_string();
+                self.logs.push(format!("📂 已设原片文件夹：{}", p.display()));
+            } else if is_image_file(&p) && !self.w_input_files.contains(&p) {
+                self.w_input_files.push(p);
+                added += 1;
+            }
+        }
+        if added > 0 {
+            self.logs.push(format!("➕ 拖入 {added} 张原片（共 {} 张单独选）", self.w_input_files.len()));
         }
     }
 
@@ -2741,20 +2885,49 @@ impl App {
 
         // 配置行 2/3：原片 / 输出文件夹
         ui.horizontal(|ui| {
-            field_label(ui, "原片文件夹");
-            let bw = 64.0;
-            let w = (ui.available_width() - bw - 8.0).max(140.0);
+            field_label(ui, "原片素材");
+            let bw = 62.0;
+            let w = (ui.available_width() - bw * 2.0 - 12.0).max(120.0);
             ui.add(
                 egui::TextEdit::singleline(&mut self.w_input_dir)
                     .desired_width(w)
-                    .hint_text("某客户的人物原片文件夹（文件夹名=客户名）"),
+                    .hint_text("选文件夹批量（夹名=客户名）；或「选图」单/多选；也可拖拽"),
             );
-            if ui.add_sized([bw, 30.0], egui::Button::new("浏览…")).clicked() {
+            if ui.add_sized([bw, 30.0], egui::Button::new("文件夹…")).clicked() {
                 if let Some(p) = rfd::FileDialog::new().pick_folder() {
                     self.w_input_dir = p.display().to_string();
                 }
             }
+            if ui
+                .add_sized([bw, 30.0], egui::Button::new("选图…"))
+                .on_hover_text("单选/多选原片（不必整文件夹），与文件夹叠加")
+                .clicked()
+            {
+                let mut n = 0;
+                for p in pick_image_files() {
+                    if !self.w_input_files.contains(&p) {
+                        self.w_input_files.push(p);
+                        n += 1;
+                    }
+                }
+                if n > 0 {
+                    self.logs.push(format!("➕ 选入 {n} 张原片（共 {} 张单独选）", self.w_input_files.len()));
+                }
+            }
         });
+        if !self.w_input_files.is_empty() {
+            ui.horizontal(|ui| {
+                ui.add_space(96.0);
+                ui.label(
+                    egui::RichText::new(format!("➕ 已单独选 {} 张原片", self.w_input_files.len()))
+                        .color(pal::ACCENT)
+                        .small(),
+                );
+                if ui.small_button("清除").clicked() {
+                    self.w_input_files.clear();
+                }
+            });
+        }
         ui.horizontal(|ui| {
             field_label(ui, "输出文件夹");
             let bw = 64.0;
@@ -2924,8 +3097,8 @@ impl App {
         }
         let in_dir = self.w_input_dir.trim().to_string();
         let out_dir = self.w_output_dir.trim().to_string();
-        if in_dir.is_empty() {
-            self.logs.push("❌ 先选原片文件夹".into());
+        if in_dir.is_empty() && self.w_input_files.is_empty() {
+            self.logs.push("❌ 先选「文件夹」或点「选图」选几张原片".into());
             return;
         }
         if out_dir.is_empty() {
@@ -2939,16 +3112,41 @@ impl App {
                 return;
             }
         };
-        let path = PathBuf::from(&in_dir);
-        let client = path
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("client")
-            .to_string();
+        // 收集输入：文件夹里的图片 + 单独选/拖入的图片（去重）
+        let mut files: Vec<PathBuf> = Vec::new();
+        if !in_dir.is_empty() {
+            if let Ok(rd) = std::fs::read_dir(&in_dir) {
+                let mut df: Vec<PathBuf> = rd.flatten().map(|e| e.path()).filter(|p| is_image_file(p)).collect();
+                df.sort();
+                files.extend(df);
+            }
+        }
+        for p in &self.w_input_files {
+            if !files.contains(p) {
+                files.push(p.clone());
+            }
+        }
+        if files.is_empty() {
+            self.logs.push("❌ 没有可处理的图片（文件夹为空且没选图）".into());
+            return;
+        }
+        // 客户名：文件夹名优先；否则取第一张图的父目录名
+        let client = if !in_dir.is_empty() {
+            PathBuf::from(&in_dir).file_name().and_then(|s| s.to_str()).unwrap_or("client").to_string()
+        } else {
+            files
+                .first()
+                .and_then(|p| p.parent())
+                .and_then(|d| d.file_name())
+                .and_then(|s| s.to_str())
+                .unwrap_or("素材")
+                .to_string()
+        };
         let skip = self.w_skip_done;
-        // 断点续跑 + 同一客户 → 复用现有账本（保留已判/手改的景别人数，已出的跳过、改过的重出）；
-        // 关掉续跑 = 从头重来 → 新建账本。
+        // 复用账本：仅「纯文件夹、未单独选图」且同客户时复用（保留手改）；选了图=新选一批，每次新建。
         let reuse = skip
+            && self.w_input_files.is_empty()
+            && !in_dir.is_empty()
             && self
                 .w_manifest
                 .as_ref()
@@ -2956,13 +3154,7 @@ impl App {
         let mut m = if reuse {
             self.w_manifest.clone().unwrap()
         } else {
-            match cstate::CManifest::init(&client, &path) {
-                Ok(m) => m,
-                Err(e) => {
-                    self.logs.push(format!("❌ 建账失败：{e}"));
-                    return;
-                }
-            }
+            cstate::CManifest::from_files(&client, &files)
         };
         m.key = self.w_tone.clone();
         m.series = if self.w_series.is_empty() { None } else { Some(self.w_series.clone()) };
@@ -3892,7 +4084,7 @@ fn main() -> Result<(), eframe::Error> {
     let store = load_store();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title(APP_TITLE)
+            .with_title(format!("{APP_TITLE}  v{APP_VERSION}"))
             .with_inner_size([store.win_w, store.win_h])
             .with_min_inner_size([880.0, 600.0]),
         ..Default::default()
@@ -4297,7 +4489,7 @@ mod tests {
 
     #[test]
     fn store_normalize_clamps() {
-        let s = Store { presets: vec![], current: 9, win_w: 1.0, win_h: -3.0, left_w: 5.0, logs_h: 0.0 }.normalized();
+        let s = Store { presets: vec![], current: 9, win_w: 1.0, win_h: -3.0, left_w: 5.0, logs_h: 0.0, ..Default::default() }.normalized();
         assert_eq!(s.presets.len(), 1, "空预设应补一个默认");
         assert_eq!(s.current, 0, "current 越界应夹紧");
         assert!(s.win_w >= 640.0 && s.win_h >= 480.0 && s.left_w >= 160.0 && s.logs_h >= 60.0);
@@ -4585,7 +4777,7 @@ mod ui_tests {
         h.state_mut().mode = AppMode::Wedding;
         h.run();
         // 用唯一的 field_label 断言（C 模式配置表单已渲染）
-        assert!(h.query_by_label("原片文件夹").is_some(), "应渲染 C 模式原片文件夹");
+        assert!(h.query_by_label("原片素材").is_some(), "应渲染 C 模式原片素材");
         assert!(h.query_by_label("输出文件夹").is_some(), "应渲染 C 模式输出文件夹");
         assert!(h.query_by_label("场景库").is_some(), "应渲染场景库状态行");
     }

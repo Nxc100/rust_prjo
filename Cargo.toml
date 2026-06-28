@@ -1,6 +1,6 @@
 [package]
 name = "visual_coast_batch"
-version = "1.0.0"
+version = "1.2.0"
 edition = "2021"
 description = "视觉海岸批量处理工作台 — RunningHub 批量精修/高清放大桌面程序"
 

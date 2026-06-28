@@ -173,6 +173,20 @@ impl CManifest {
         })
     }
 
+    /// 从一组明确的图片文件建 manifest（用于「单选/多选图片」而非整文件夹）。
+    pub fn from_files(client: &str, files: &[PathBuf]) -> CManifest {
+        let jobs = files
+            .iter()
+            .enumerate()
+            .map(|(i, p)| CJob::new(format!("{:02}", i + 1), p.display().to_string()))
+            .collect();
+        CManifest {
+            client: client.to_string(),
+            jobs,
+            ..Default::default()
+        }
+    }
+
     pub fn load(path: &Path) -> Result<CManifest> {
         let s = std::fs::read_to_string(path)?;
         Ok(serde_json::from_str(&s)?)
