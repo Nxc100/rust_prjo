@@ -20,7 +20,7 @@ pub const MODEL: &str = "gpt-image-2";
 /// 视觉判景别用的模型（4sapi `/v1/messages` Claude 原生格式）。
 pub const VISION_MODEL: &str = "claude-sonnet-4-6";
 
-const SHOT_PROMPT: &str = "你是婚纱摄影「景别+人数」判定助手。只看这张人物原片本身判定，严格只输出一行 JSON、不要任何解释或多余文字：\n{\"shot\":\"full|medium|close|closeup\",\"subjects\":1或2}\n景别标准：full=全身(鞋/脚踝可见，或裙摆及地完整入画)；medium=中景(膝~腰之间、脚不入镜，七分身也算 medium)；close=近景(胸口~腋下、头肩胸占满画面)；closeup=特写(肩颈以上、脸占画面比例很大)。subjects=画面里的主体人数(1 或 2)，双人以更全的那位定景别。拿不准时取更「远」的那档。";
+const SHOT_PROMPT: &str = "你是婚纱样片的「景别 + 人数」判定助手。只看这张人物原片本身，严格只输出一行 JSON、不要任何解释或多余文字：\n{\"shot\":\"full|medium|close|closeup\",\"subjects\":1或2}\n【景别 shot】full=全身(鞋/脚踝可见，或裙摆及地完整入画)；medium=中景(膝~腰之间、脚不入镜，七分身也算 medium)；close=近景(胸口~腋下、头肩胸占满画面)；closeup=特写(肩颈以上、脸占画面比例很大)。景别拿不准时取更「远」的那档。\n【人数 subjects】只数画面里的婚纱**主体人物**：1=单人(只有一位新娘或新郎)，2=两人(一对新人)。背景路人、只露出的一只手或胳膊、镜子里的倒影、人形道具或画像**都不算人**。拿不准时按 1(单人)——宁可少数，绝不凭空多数出一个人。";
 
 #[derive(Clone)]
 pub struct FsClient {
@@ -175,6 +175,7 @@ impl FsClient {
         let body = serde_json::json!({
             "model": VISION_MODEL,
             "max_tokens": 100,
+            "temperature": 0,
             "messages": [{ "role": "user", "content": [
                 { "type": "image", "source": { "type": "base64", "media_type": "image/jpeg", "data": b64 } },
                 { "type": "text", "text": SHOT_PROMPT }

@@ -350,6 +350,37 @@ enum AppMode {
     Wedding,
 }
 
+// 人物入景列表筛选（对齐 RunningHub 的 全部/进行中/成功/跳过/失败）
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WListFilter {
+    All,
+    Active,
+    Ok,
+    Skipped,
+    Failed,
+}
+impl WListFilter {
+    fn label(self) -> &'static str {
+        match self {
+            WListFilter::All => "全部",
+            WListFilter::Active => "进行中",
+            WListFilter::Ok => "成功",
+            WListFilter::Skipped => "跳过",
+            WListFilter::Failed => "失败",
+        }
+    }
+    fn matches(self, st: cstate::CStatus) -> bool {
+        use cstate::CStatus::*;
+        match self {
+            WListFilter::All => true,
+            WListFilter::Active => matches!(st, Pending | Prompted | Generating),
+            WListFilter::Ok => matches!(st, AwaitingQc | Selected | Done),
+            WListFilter::Skipped => st == Skipped,
+            WListFilter::Failed => matches!(st, QcFail | Failed),
+        }
+    }
+}
+
 // 场景库目录：exe 同目录/assets/wedding 优先；否则项目相对路径（开发时）。
 fn default_scene_dir() -> String {
     if let Ok(exe) = std::env::current_exe() {
@@ -501,6 +532,9 @@ struct App {
     w_tone: String,      // 调色 natural|warm|overcast
     w_series: String,    // 场景概念池（空=全部）
     w_scene_dir: String, // 场景库目录（含 templates/ scenes/）
+    w_concurrency: usize, // 并发出图数（1-8）
+    w_skip_done: bool,    // 断点续跑：跳过已有结果
+    w_list_filter: WListFilter,
     w_assets: Option<cmode::Assets>,
     w_assets_err: Option<String>,
     w_manifest: Option<cstate::CManifest>,
@@ -567,6 +601,9 @@ impl App {
             w_tone: "natural".into(),
             w_series: String::new(),
             w_scene_dir: default_scene_dir(),
+            w_concurrency: 2,
+            w_skip_done: true,
+            w_list_filter: WListFilter::All,
             w_assets: None,
             w_assets_err: None,
             w_manifest: None,
@@ -2199,11 +2236,14 @@ fn tone_label(s: &str) -> &'static str {
 fn w_status_chip(ui: &mut egui::Ui, st: cstate::CStatus) {
     let color = match st {
         cstate::CStatus::Pending => pal::TEXT_WEAK,
-        cstate::CStatus::Prompted => pal::INFO,
-        cstate::CStatus::AwaitingQc => pal::WARN,
+        cstate::CStatus::Prompted => pal::TEXT_WEAK,
+        cstate::CStatus::Generating => pal::INFO,
+        cstate::CStatus::AwaitingQc => pal::SUCCESS,
         cstate::CStatus::Selected => pal::ACCENT,
         cstate::CStatus::Done => pal::SUCCESS,
         cstate::CStatus::QcFail => pal::ERROR,
+        cstate::CStatus::Skipped => pal::WARN,
+        cstate::CStatus::Failed => pal::ERROR,
     };
     egui::Frame {
         inner_margin: egui::Margin::symmetric(8, 2),
@@ -2241,18 +2281,59 @@ fn w_spawn_decode(
 }
 
 // 人物入景一键流水线（后台线程）：判景别 → 自动选景排重 → 装配 → 双图出图（断点续跑）。
+// 简单并发执行器：n 个 worker 从队列取索引执行 f（f 必须 Send + Clone + 'static）。
+fn run_pool<F>(n: usize, items: Vec<usize>, stop: &Arc<AtomicBool>, f: F)
+where
+    F: Fn(usize) + Send + Clone + 'static,
+{
+    if items.is_empty() {
+        return;
+    }
+    let (jtx, jrx) = crossbeam_channel::unbounded::<usize>();
+    for it in items {
+        let _ = jtx.send(it);
+    }
+    drop(jtx);
+    let mut handles = Vec::new();
+    for _ in 0..n.max(1) {
+        let jrx = jrx.clone();
+        let stop = stop.clone();
+        let f = f.clone();
+        handles.push(std::thread::spawn(move || {
+            while let Ok(i) = jrx.recv() {
+                if stop.load(Ordering::SeqCst) {
+                    break;
+                }
+                f(i);
+            }
+        }));
+    }
+    for h in handles {
+        let _ = h.join();
+    }
+}
+
+// 输出文件名按人物原片名（断点续跑对增删图鲁棒，对齐 RunningHub）。
+fn w_out_name(out_dir: &str, input: &str) -> PathBuf {
+    let stem = Path::new(input).file_stem().and_then(|s| s.to_str()).unwrap_or("img");
+    Path::new(out_dir).join(format!("{stem}_c.png"))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn w_pipeline(
-    mut m: cstate::CManifest,
+    m: cstate::CManifest,
     assets: cmode::Assets,
     key: String,
     out_dir: String,
     scene_base: PathBuf,
-    client: String,
+    _client: String,
     tx: Sender<Msg>,
     ctx: egui::Context,
     stop: Arc<AtomicBool>,
+    concurrency: usize,
+    skip_done: bool,
 ) {
+    use std::sync::Mutex;
     let log = |s: String| {
         let _ = tx.send(Msg::Log(s));
         ctx.request_repaint();
@@ -2266,39 +2347,95 @@ fn w_pipeline(
             return;
         }
     };
+    let _ = std::fs::create_dir_all(&out_dir);
+    let n = concurrency.max(1);
+    let m = Arc::new(Mutex::new(m));
 
-    // 阶段 A：判景别 + 人数（缺 shot/subjects 的单；左侧已手填的尊重不覆盖）。
-    for i in 0..m.jobs.len() {
-        if stop.load(Ordering::SeqCst) {
-            break;
-        }
-        let (no, input, need) = {
-            let j = &m.jobs[i];
-            (j.no.clone(), j.input.clone(), j.shot.is_none() || j.subjects.is_none())
-        };
-        if !need {
-            continue;
-        }
-        log(format!("  判景别 {no}…"));
-        let (shot, subj) = match cli.judge_shot(Path::new(&input)) {
-            Ok(v) => v,
-            Err(e) => {
-                log(format!("  ⚠ {no} 判景别失败（默认 全身/双人）：{e}"));
-                ("full".to_string(), 2)
+    // 预跳过（断点续跑）：输出已存在、且仍是「待装配」的单直接标「已跳过」，不判景别、不出图（省 token/钱）。
+    // 复用账本里已判/已出/已选/手改的单不动（手改重出的单已被 w_edit_job 删了旧图、回 Pending）。
+    if skip_done {
+        let len = m.lock().unwrap().jobs.len();
+        for i in 0..len {
+            let (no, input, st) = {
+                let g = m.lock().unwrap();
+                (g.jobs[i].no.clone(), g.jobs[i].input.clone(), g.jobs[i].status)
+            };
+            if st != cstate::CStatus::Pending {
+                continue;
             }
-        };
-        m.jobs[i].shot = Some(shot.clone());
-        m.jobs[i].subjects = Some(subj);
-        let _ = tx.send(Msg::WJob {
-            no: no.clone(),
-            shot: Some(shot.clone()),
-            subjects: Some(subj),
-            scene: None,
-            scene_file: None,
-            output: None,
-            status: cstate::CStatus::Pending,
+            let outp = w_out_name(&out_dir, &input);
+            if outp.exists() {
+                {
+                    let mut g = m.lock().unwrap();
+                    g.jobs[i].status = cstate::CStatus::Skipped;
+                    g.jobs[i].outputs = vec![outp.display().to_string()];
+                }
+                let _ = tx.send(Msg::WJob {
+                    no,
+                    shot: None,
+                    subjects: None,
+                    scene: None,
+                    scene_file: None,
+                    output: Some(outp.display().to_string()),
+                    status: cstate::CStatus::Skipped,
+                });
+            }
+        }
+        ctx.request_repaint();
+    }
+
+    // 阶段 A：判景别（并发；跳过未跳过且缺 shot/subjects 的单）。
+    let judge_idx: Vec<usize> = {
+        let g = m.lock().unwrap();
+        (0..g.jobs.len())
+            .filter(|&i| {
+                let j = &g.jobs[i];
+                j.status != cstate::CStatus::Skipped && (j.shot.is_none() || j.subjects.is_none())
+            })
+            .collect()
+    };
+    {
+        let cli = cli.clone();
+        let m = m.clone();
+        let tx = tx.clone();
+        let ctx = ctx.clone();
+        run_pool(n, judge_idx, &stop, move |i| {
+            let (no, input) = {
+                let g = m.lock().unwrap();
+                (g.jobs[i].no.clone(), g.jobs[i].input.clone())
+            };
+            let _ = tx.send(Msg::Log(format!("  判景别 {no}…")));
+            ctx.request_repaint();
+            let (shot, subj) = match cli.judge_shot(Path::new(&input)) {
+                Ok(v) => v,
+                Err(e) => {
+                    let _ = tx.send(Msg::Log(format!(
+                        "  ⚠ {no} 判景别失败，默认 全身/单人（请左侧核对人数，必要时改后重出）：{e}"
+                    )));
+                    ("full".to_string(), 1)
+                }
+            };
+            {
+                let mut g = m.lock().unwrap();
+                g.jobs[i].shot = Some(shot.clone());
+                g.jobs[i].subjects = Some(subj);
+            }
+            let _ = tx.send(Msg::WJob {
+                no: no.clone(),
+                shot: Some(shot.clone()),
+                subjects: Some(subj),
+                scene: None,
+                scene_file: None,
+                output: None,
+                status: cstate::CStatus::Pending,
+            });
+            let _ = tx.send(Msg::Log(format!(
+                "  {no} → 景别 {} · {}",
+                shot,
+                if subj == 1 { "单人" } else { "双人" }
+            )));
+            ctx.request_repaint();
         });
-        log(format!("  {no} → 景别 {} · {}", shot, if subj == 1 { "单人" } else { "双人" }));
     }
     if stop.load(Ordering::SeqCst) {
         log("⏹ 已停止。".into());
@@ -2307,82 +2444,108 @@ fn w_pipeline(
         return;
     }
 
-    // 阶段 B：自动选景排重 + 装配。
-    m.auto_plan(&assets.scenes);
-    let _ = m.assemble(&assets);
-    for j in &m.jobs {
-        let _ = tx.send(Msg::WJob {
-            no: j.no.clone(),
-            shot: None,
-            subjects: None,
-            scene: j.scene.clone(),
-            scene_file: j.scene_file.clone(),
-            output: None,
-            status: j.status,
-        });
+    // 阶段 B：自动选景排重 + 装配（顺序，含跨单排重依赖）。
+    {
+        let mut g = m.lock().unwrap();
+        g.auto_plan(&assets.scenes);
+        let _ = g.assemble(&assets);
+        for j in &g.jobs {
+            let _ = tx.send(Msg::WJob {
+                no: j.no.clone(),
+                shot: None,
+                subjects: None,
+                scene: j.scene.clone(),
+                scene_file: j.scene_file.clone(),
+                output: None,
+                status: j.status,
+            });
+        }
     }
     ctx.request_repaint();
 
-    // 阶段 C：逐单双图出图（输出已存在则跳过＝断点续跑）。
-    let _ = std::fs::create_dir_all(&out_dir);
-    let todo: Vec<usize> = (0..m.jobs.len())
-        .filter(|&i| m.jobs[i].status == cstate::CStatus::Prompted)
-        .collect();
-    for i in todo {
-        if stop.load(Ordering::SeqCst) {
-            break;
-        }
-        let (no, input, prompt, scene_file) = {
-            let j = &m.jobs[i];
-            (
-                j.no.clone(),
-                j.input.clone(),
-                j.prompt.clone().unwrap_or_default(),
-                j.scene_file.clone().unwrap_or_default(),
-            )
-        };
-        if prompt.is_empty() || scene_file.is_empty() {
-            log(format!("  跳过 {no}：未成功装配（catalog 可能缺该景别场景）"));
-            continue;
-        }
-        let outp = Path::new(&out_dir).join(format!("{client}_{no}_c1.png"));
-        if outp.exists() {
-            log(format!("  ⏭ {no} 已有结果，跳过"));
-            let _ = tx.send(Msg::WJob {
-                no,
+    // 阶段 C：双图出图（并发）。
+    let gen_idx: Vec<usize> = {
+        let g = m.lock().unwrap();
+        (0..g.jobs.len())
+            .filter(|&i| g.jobs[i].status == cstate::CStatus::Prompted)
+            .collect()
+    };
+    {
+        let cli = cli.clone();
+        let m = m.clone();
+        let tx = tx.clone();
+        let ctx = ctx.clone();
+        let out_dir = out_dir.clone();
+        let scene_base = scene_base.clone();
+        run_pool(n, gen_idx, &stop, move |i| {
+            let (no, input, prompt, scene_file) = {
+                let g = m.lock().unwrap();
+                let j = &g.jobs[i];
+                (
+                    j.no.clone(),
+                    j.input.clone(),
+                    j.prompt.clone().unwrap_or_default(),
+                    j.scene_file.clone().unwrap_or_default(),
+                )
+            };
+            let fail = |st: cstate::CStatus| Msg::WJob {
+                no: no.clone(),
                 shot: None,
                 subjects: None,
                 scene: None,
                 scene_file: None,
-                output: Some(outp.display().to_string()),
-                status: cstate::CStatus::AwaitingQc,
+                output: None,
+                status: st,
+            };
+            if prompt.is_empty() || scene_file.is_empty() {
+                let _ = tx.send(Msg::Log(format!("  跳过 {no}：未成功装配（catalog 可能缺该景别场景）")));
+                let _ = tx.send(fail(cstate::CStatus::Failed));
+                return;
+            }
+            let _ = tx.send(Msg::WJob {
+                no: no.clone(),
+                shot: None,
+                subjects: None,
+                scene: None,
+                scene_file: None,
+                output: None,
+                status: cstate::CStatus::Generating,
             });
-            continue;
-        }
-        let person = PathBuf::from(&input);
-        let plate = scene_base.join(&scene_file);
-        let (w, h) = image::image_dimensions(&person).unwrap_or((1024, 1536));
-        let size = cmode::size_for_aspect(w, h);
-        log(format!("  ▶ 出图 {no}（{size}）…"));
-        match cli.edit_dual(&person, &plate, &prompt, size, "high") {
-            Ok(bytes) => match std::fs::write(&outp, &bytes) {
-                Ok(()) => {
-                    log(format!("  ✓ {no} 完成"));
-                    let _ = tx.send(Msg::WJob {
-                        no,
-                        shot: None,
-                        subjects: None,
-                        scene: None,
-                        scene_file: None,
-                        output: Some(outp.display().to_string()),
-                        status: cstate::CStatus::AwaitingQc,
-                    });
+            let person = PathBuf::from(&input);
+            let plate = scene_base.join(&scene_file);
+            let (w, h) = image::image_dimensions(&person).unwrap_or((1024, 1536));
+            let size = cmode::size_for_aspect(w, h);
+            let _ = tx.send(Msg::Log(format!("  ▶ 出图 {no}（{size}）…")));
+            ctx.request_repaint();
+            let outp = w_out_name(&out_dir, &input);
+            match cli.edit_dual(&person, &plate, &prompt, size, "high") {
+                Ok(bytes) => match std::fs::write(&outp, &bytes) {
+                    Ok(()) => {
+                        let _ = tx.send(Msg::Log(format!("  ✓ {no} 完成")));
+                        let _ = tx.send(Msg::WJob {
+                            no: no.clone(),
+                            shot: None,
+                            subjects: None,
+                            scene: None,
+                            scene_file: None,
+                            output: Some(outp.display().to_string()),
+                            status: cstate::CStatus::AwaitingQc,
+                        });
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Msg::Log(format!("  ✗ {no} 写文件失败：{e}")));
+                        let _ = tx.send(fail(cstate::CStatus::Failed));
+                    }
+                },
+                Err(e) => {
+                    let _ = tx.send(Msg::Log(format!("  ✗ {no} 出图失败：{e}")));
+                    let _ = tx.send(fail(cstate::CStatus::Failed));
                 }
-                Err(e) => log(format!("  ✗ {no} 写文件失败：{e}")),
-            },
-            Err(e) => log(format!("  ✗ {no} 出图失败：{e}")),
-        }
+            }
+            ctx.request_repaint();
+        });
     }
+
     log(format!(
         "{}本轮结束（结果在输出夹）。",
         if stop.load(Ordering::SeqCst) { "⏹ 已停止，" } else { "" }
@@ -2638,6 +2801,14 @@ impl App {
             }
         });
 
+        // 并发 / 断点续跑（对齐 RunningHub）
+        ui.horizontal(|ui| {
+            field_label(ui, "并发数");
+            ui.add(egui::Slider::new(&mut self.w_concurrency, 1..=8));
+            ui.add_space(12.0);
+            ui.checkbox(&mut self.w_skip_done, "跳过已处理（断点续跑）");
+        });
+
         ui.add_space(10.0);
         // —— 一键自动流水线 ——
         let has_sel = self
@@ -2687,31 +2858,32 @@ impl App {
             }
         });
 
-        // 进度 + 统计
+        // 进度 + 统计（对齐 RunningHub）
         if let Some(m) = &self.w_manifest {
-            let tot = m.jobs.len();
-            let produced = m.jobs.iter().filter(|j| !j.outputs.is_empty()).count();
-            let fail = m.jobs.iter().filter(|j| j.status == cstate::CStatus::QcFail).count();
+            let (tot, active, ok, skip, fail) = m.counts();
+            let done = ok + skip; // 已出结果（成功 + 跳过）
             if tot > 0 {
                 ui.add_space(8.0);
-                let frac = produced as f32 / tot as f32;
+                let frac = (done + fail) as f32 / tot as f32;
                 ui.add(
                     egui::ProgressBar::new(frac)
                         .desired_height(16.0)
                         .corner_radius(egui::CornerRadius::same(8))
                         .fill(pal::ACCENT)
                         .text(
-                            egui::RichText::new(format!("{produced} / {tot}   {:.0}%", frac * 100.0))
+                            egui::RichText::new(format!("{} / {tot}   {:.0}%", done + fail, frac * 100.0))
                                 .color(pal::TEXT)
                                 .small(),
                         ),
                 );
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
-                    count_chip(ui, format!("✓ 已出图 {produced}"), pal::SUCCESS);
-                    count_chip(ui, format!("共 {tot}"), pal::TEXT_WEAK);
-                    if fail > 0 {
-                        count_chip(ui, format!("✗ 失败/废 {fail}"), pal::ERROR);
+                    count_chip(ui, format!("✓ 成功 {ok}"), pal::SUCCESS);
+                    count_chip(ui, format!("⏭ 跳过 {skip}"), pal::WARN);
+                    count_chip(ui, format!("✗ 失败 {fail}"), pal::ERROR);
+                    if self.w_running {
+                        ui.add_space(4.0);
+                        ui.label(egui::RichText::new(format!("进行中 {active}…")).color(pal::INFO).small());
                     }
                 });
             }
@@ -2773,31 +2945,53 @@ impl App {
             .and_then(|s| s.to_str())
             .unwrap_or("client")
             .to_string();
-        let mut m = match cstate::CManifest::init(&client, &path) {
-            Ok(m) => m,
-            Err(e) => {
-                self.logs.push(format!("❌ 建账失败：{e}"));
-                return;
+        let skip = self.w_skip_done;
+        // 断点续跑 + 同一客户 → 复用现有账本（保留已判/手改的景别人数，已出的跳过、改过的重出）；
+        // 关掉续跑 = 从头重来 → 新建账本。
+        let reuse = skip
+            && self
+                .w_manifest
+                .as_ref()
+                .map_or(false, |m| m.client == client && !m.jobs.is_empty());
+        let mut m = if reuse {
+            self.w_manifest.clone().unwrap()
+        } else {
+            match cstate::CManifest::init(&client, &path) {
+                Ok(m) => m,
+                Err(e) => {
+                    self.logs.push(format!("❌ 建账失败：{e}"));
+                    return;
+                }
             }
         };
         m.key = self.w_tone.clone();
         m.series = if self.w_series.is_empty() { None } else { Some(self.w_series.clone()) };
+        if reuse {
+            self.logs.push(format!("（复用「{client}」账本：保留景别/人数，已出的跳过、改过的重出）"));
+        }
         self.w_manifest = Some(m.clone());
-        self.w_sel = Some(0);
+        if self.w_sel.is_none() {
+            self.w_sel = Some(0);
+        }
         self.w_running = true;
         self.w_stop = Arc::new(AtomicBool::new(false));
         self.w_save();
+        let conc = self.w_concurrency.max(1);
         self.logs.push(format!(
-            "▶ 开始「{}」：{} 张 → 自动判景别({}) → 选景装配 → 双图出图（已存在结果自动跳过）",
+            "▶ 开始「{}」：{} 张，并发 {} → 自动判景别({}) → 选景装配 → 双图出图{}",
             client,
             m.jobs.len(),
-            foursapi::VISION_MODEL
+            conc,
+            foursapi::VISION_MODEL,
+            if skip { "（断点续跑：已有结果跳过）" } else { "（全部重出）" }
         ));
         let scene_base = PathBuf::from(self.w_scene_dir.trim());
         let tx = self.tx.clone();
         let ctx2 = ctx.clone();
         let stop = self.w_stop.clone();
-        std::thread::spawn(move || w_pipeline(m, assets, key, out_dir, scene_base, client, tx, ctx2, stop));
+        std::thread::spawn(move || {
+            w_pipeline(m, assets, key, out_dir, scene_base, client, tx, ctx2, stop, conc, skip)
+        });
     }
 
     fn w_collect(&mut self) {
@@ -2841,6 +3035,46 @@ impl App {
         self.w_save();
     }
 
+    // 手改某单的景别/人数：删旧图、清记录、回「待装配」，下次「▶ 开始」只重出这一张（其它已出的仍跳过）。
+    fn w_edit_job(&mut self, no: &str, shot: Option<String>, subjects: Option<u8>) {
+        let mut note = String::new();
+        if let Some(m) = self.w_manifest.as_mut() {
+            if let Some(j) = m.jobs.iter_mut().find(|j| j.no == no) {
+                if let Some(s) = &shot {
+                    j.shot = Some(s.clone());
+                }
+                if let Some(s) = subjects {
+                    j.subjects = Some(s);
+                }
+                // 删旧结果文件 + 清记录 + 回 Pending（断点续跑下会重出这一张）
+                for o in &j.outputs {
+                    let _ = std::fs::remove_file(o);
+                }
+                j.outputs.clear();
+                j.selected = None;
+                j.needs_upscale = None;
+                j.prompt = None;
+                j.tpl_md5 = None;
+                if shot.is_some() {
+                    // 改了景别 → 清场景，下次自动重选合适的
+                    j.scene = None;
+                    j.scene_file = None;
+                }
+                j.status = cstate::CStatus::Pending;
+                note = match (&shot, subjects) {
+                    (Some(s), _) => format!("✎ {no} 景别改为「{}」，已清旧图、待重出（点「▶ 开始」）", shot_label(s)),
+                    (None, Some(1)) => format!("✎ {no} 改为「单人」，已清旧图、待重出（点「▶ 开始」）"),
+                    (None, Some(2)) => format!("✎ {no} 改为「双人」，已清旧图、待重出（点「▶ 开始」）"),
+                    _ => format!("✎ {no} 已改、待重出"),
+                };
+            }
+        }
+        if !note.is_empty() {
+            self.logs.push(note);
+            self.w_save();
+        }
+    }
+
     fn w_list(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new("单子列表").color(pal::TEXT).strong());
@@ -2850,22 +3084,40 @@ impl App {
                 });
             }
         });
+        // 状态筛选（全部/进行中/成功/跳过/失败）
+        if self.w_manifest.is_some() {
+            ui.horizontal_wrapped(|ui| {
+                for f in [
+                    WListFilter::All,
+                    WListFilter::Active,
+                    WListFilter::Ok,
+                    WListFilter::Skipped,
+                    WListFilter::Failed,
+                ] {
+                    if ui.selectable_label(self.w_list_filter == f, f.label()).clicked() {
+                        self.w_list_filter = f;
+                    }
+                }
+            });
+        }
         ui.add_space(6.0);
         if self.w_manifest.is_none() {
             ui.add_space(20.0);
             ui.vertical_centered(|ui| {
-                ui.label(egui::RichText::new("填好上方配置后点「① 建账」").color(pal::TEXT_WEAK).small());
+                ui.label(egui::RichText::new("填好配置后点「▶ 开始」").color(pal::TEXT_WEAK).small());
             });
             return;
         }
-        let scenes = self.w_assets.as_ref().map(|a| a.scenes.clone()).unwrap_or_default();
-        let snapshot: Vec<(String, Option<String>, Option<u8>, Option<String>, cstate::CStatus)> = self
+        let filter = self.w_list_filter;
+        let snapshot: Vec<(usize, String, Option<String>, Option<u8>, Option<String>, cstate::CStatus)> = self
             .w_manifest
             .as_ref()
             .unwrap()
             .jobs
             .iter()
-            .map(|j| (j.no.clone(), j.shot.clone(), j.subjects, j.scene.clone(), j.status))
+            .enumerate()
+            .filter(|(_, j)| filter.matches(j.status))
+            .map(|(i, j)| (i, j.no.clone(), j.shot.clone(), j.subjects, j.scene.clone(), j.status))
             .collect();
         let mut click: Option<usize> = None;
         let mut edits: Vec<(String, Option<String>, Option<u8>)> = Vec::new();
@@ -2873,8 +3125,8 @@ impl App {
             .id_salt("w_list_scroll")
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                for (i, (no, shot, subj, scene, status)) in snapshot.iter().enumerate() {
-                    let selected = self.w_sel == Some(i);
+                for (idx, no, shot, subj, scene, status) in &snapshot {
+                    let selected = self.w_sel == Some(*idx);
                     let bg = if selected { tint(pal::ACCENT, 36) } else { egui::Color32::TRANSPARENT };
                     egui::Frame {
                         inner_margin: egui::Margin::symmetric(6, 5),
@@ -2891,7 +3143,7 @@ impl App {
                                 .selectable_label(selected, egui::RichText::new(format!("#{no}")).strong())
                                 .clicked()
                             {
-                                click = Some(i);
+                                click = Some(*idx);
                             }
                             let cur = shot.clone().unwrap_or_default();
                             egui::ComboBox::from_id_salt(format!("w_shot_{no}"))
@@ -2923,15 +3175,8 @@ impl App {
         if let Some(i) = click {
             self.w_sel = Some(i);
         }
-        if !edits.is_empty() {
-            for (no, shot, subj) in edits {
-                if let Some(m) = self.w_manifest.as_mut() {
-                    if let Err(e) = m.set_job(&no, shot, subj, None, &scenes) {
-                        self.logs.push(format!("⚠ {no}：{e}"));
-                    }
-                }
-            }
-            self.w_save();
+        for (no, shot, subj) in edits {
+            self.w_edit_job(&no, shot, subj);
         }
     }
 
@@ -3000,7 +3245,9 @@ impl App {
                 } else {
                     let (txt, col) = match status {
                         cstate::CStatus::QcFail => ("已判废", pal::WARN),
-                        cstate::CStatus::Prompted => ("待出图（点上方④）", pal::INFO),
+                        cstate::CStatus::Failed => ("出图失败（见日志）", pal::ERROR),
+                        cstate::CStatus::Generating => ("生成中…", pal::INFO),
+                        cstate::CStatus::Prompted => ("待出图", pal::INFO),
                         _ => ("尚未出图", pal::TEXT_WEAK),
                     };
                     ui.label(egui::RichText::new(txt).color(col));
@@ -3016,7 +3263,12 @@ impl App {
             if has_out && open_btn(ui, "🔍  打开结果") {
                 open_file(Path::new(&outputs[0]));
             }
-            if has_out && matches!(status, cstate::CStatus::AwaitingQc | cstate::CStatus::Selected) {
+            if has_out
+                && matches!(
+                    status,
+                    cstate::CStatus::AwaitingQc | cstate::CStatus::Selected | cstate::CStatus::Skipped
+                )
+            {
                 let pick = outputs[0].clone();
                 if ui.button("✓ 选用").clicked() {
                     self.w_select(&no, &pick);
