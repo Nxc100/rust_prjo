@@ -574,6 +574,8 @@ struct App {
 
     // 主题/字体是否已应用到当前 ctx（首帧懒应用，便于 headless 测试）
     themed: bool,
+    // 进度条平滑动画的当前显示值（视觉用，非真实进度）
+    prog_anim: f32,
 
     // —— 人物入景（C 模式）——
     mode: AppMode,
@@ -656,6 +658,7 @@ impl App {
             cmp_fit_w: 1.0,
             finished_banner: false,
             themed: false,
+            prog_anim: 0.0,
 
             mode: AppMode::RunningHub,
             w_4sapi_key: w_key,
@@ -937,6 +940,7 @@ impl App {
         // 3) 重置运行状态并启动后台
         self.stop = Arc::new(AtomicBool::new(false));
         self.running = true;
+        self.prog_anim = 0.0;
         if is_full {
             self.items.clear();
             self.selected = None;
@@ -1171,6 +1175,25 @@ impl App {
         self.cmp_wipe = 0.5;
     }
 
+    // 进度条平滑动画：跑动中按真实进度映射到 0..90% 作下限，再叠加缓慢「涓流」（带轻微抖动、
+    // 越接近越慢，自然「卡」在 90~95% 的最后一段），真完成后快速补满到 100%。
+    // 纯视觉用——计数文本仍显示真实数；real ∈ [0,1] 是真实进度。
+    fn anim_progress(&mut self, ctx: &egui::Context, real: f32, running: bool) -> f32 {
+        let dt = ctx.input(|i| i.stable_dt).clamp(0.001, 0.1);
+        if running {
+            let base = (real * 0.9).clamp(0.0, 0.9); // 真实进度映射到 0..90%（长批量跟着真实走）
+            let t = ctx.input(|i| i.time) as f32;
+            let jitter = 0.4 + 0.6 * (0.5 + 0.5 * (t * 0.8).sin()); // 0.4..1.0 起伏 → 偶尔「卡一下」
+            let rate = 0.22 * jitter;
+            let creep = self.prog_anim + (0.95 - self.prog_anim).max(0.0) * (1.0 - (-rate * dt).exp());
+            self.prog_anim = creep.max(base).min(0.95); // 封顶 95%，最后 5% 留给真完成
+        } else {
+            // 不在跑：吸附到真实进度（完成→100%；中途停→保持当前不回退），1 帧 settle、不无限重绘。
+            self.prog_anim = self.prog_anim.max(real).clamp(0.0, 1.0);
+        }
+        self.prog_anim.clamp(0.0, 1.0)
+    }
+
     // 为选中项按需请求大图预览解码（后台线程解码，避免卡 UI）。
     // 预览用「全分辨率」纹理（按 GPU 纹理上限夹紧），这样放大对比时仍清晰，
     // 而不是把上限 ~1100px 的小图拉大导致发虚。为控制显存，只保留当前选中项的大图，
@@ -1326,8 +1349,9 @@ impl App {
             );
         }
 
+        // 跑动中持续重绘（~30fps）让进度条平滑创进；停下后吸附到真实进度，1 帧即 settle。
         if self.running || self.w_running {
-            ctx.request_repaint_after(Duration::from_millis(150));
+            ctx.request_repaint_after(Duration::from_millis(33));
         }
     }
 }
@@ -1438,7 +1462,8 @@ impl App {
         if total > 0 {
             ui.add_space(8.0);
             let (done, ok, skip, fail) = self.counts();
-            let frac = done as f32 / total as f32;
+            let real = done as f32 / total as f32;
+            let frac = self.anim_progress(ctx, real, self.running);
             ui.add(
                 egui::ProgressBar::new(frac)
                     .desired_height(16.0)
@@ -3032,12 +3057,13 @@ impl App {
         });
 
         // 进度 + 统计（对齐 RunningHub）
-        if let Some(m) = &self.w_manifest {
-            let (tot, active, ok, skip, fail) = m.counts();
+        let counts = self.w_manifest.as_ref().map(|m| m.counts());
+        if let Some((tot, active, ok, skip, fail)) = counts {
             let done = ok + skip; // 已出结果（成功 + 跳过）
             if tot > 0 {
                 ui.add_space(8.0);
-                let frac = (done + fail) as f32 / tot as f32;
+                let real = (done + fail) as f32 / tot as f32;
+                let frac = self.anim_progress(ctx, real, self.w_running);
                 ui.add(
                     egui::ProgressBar::new(frac)
                         .desired_height(16.0)
@@ -3166,6 +3192,7 @@ impl App {
             self.w_sel = Some(0);
         }
         self.w_running = true;
+        self.prog_anim = 0.0;
         self.w_stop = Arc::new(AtomicBool::new(false));
         self.w_save();
         let conc = self.w_concurrency.max(1);
